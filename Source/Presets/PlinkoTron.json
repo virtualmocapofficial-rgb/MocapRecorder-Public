@@ -1,0 +1,34 @@
+{
+	"PresetName": "PlinkoTron",
+	"CaptureSampleRateHz": 60,
+	"ExportFrameRateFps": 30,
+	"PreserveSourceSampleRate": false,
+	"AssetPath": "/Game/MocapCaptures",
+	"AutoBakeOnStop": true,
+	"AutoExportAfterBake": true,
+	"GroupedExportRootDirectory": "C:\\Users\\kyle\\Desktop\\dotf_journey_to movie\\mocap\\Mass Exporting",
+	"GroupedExportBatchName": "TronSimulation",
+	"ClassRules": [
+		{
+			"ActorClass": "/Game/Blueprints/Environment/BulletSphere.BulletSphere_C",
+			"Enabled": true,
+			"RequiredTag": "",
+			"RequireSkeletalMesh": false,
+			"TransformOnly": false,
+			"CaptureMode": "Skeletal",
+			"Group": "",
+			"Folder": "BulletSphere",
+			"AutoStop":
+			{
+				"StopWhenNearlyStationary": true,
+				"LinearSpeedThreshold": 5,
+				"StationaryHoldSeconds": 0.25,
+				"StopWhenOutOfPlayerRadius": false,
+				"PlayerRadius": 5000,
+				"StopOnHitEvent": false,
+				"StopOnDestroyed": true,
+				"AutoBakeOnAutoStop": true
+			}
+		}
+	]
+}
