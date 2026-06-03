@@ -33,4 +33,6 @@ Mocap Recorder is a UE5 animation recording plugin for capturing skeletal motion
 
 For new projects, use a C++ UE5 project when working with this plugin. C++ projects are the smoothest path for compiling native plugin code and resolving engine/plugin module dependencies.
 
-For an existing Blueprint-only project, make a backup of the project first. Then open the project in Unreal Engine and create one blank C++ class from `Tools > New C++ Class`. Choose a simple empty class, let Unreal generate the project files, then close the editor and compile the project from your IDE. After the project can compile as a C++ project, install the plugin into the `Plugins` folder and rebuild.
+For an existing Blueprint-only project, make a backup of the project first. Then open the project in Unreal Engine and create one blank C++ class from `Tools > New C++ Class`. Choose a simple empty class and let Unreal generate the project files.
+
+You only need to compile from your IDE one time. This one-time IDE compile allows Unreal to build and load the native plugin modules in your Blueprint project. After that first successful compile, you can reopen the project and continue working normally in Unreal Engine and Blueprints.
