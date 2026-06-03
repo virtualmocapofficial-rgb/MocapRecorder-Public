@@ -17,6 +17,23 @@ Mocap Recorder is a UE5 animation recording plugin for capturing skeletal motion
 - Preset save/load support for capture session setups.
 - Grouped scene FBX export helpers and compatibility with Unreal's native Animation Sequence FBX export workflow.
 
+## Companion Plugin
+
+For live full-body tracker input and calibration, see [FBT Unreal Kit](https://github.com/virtualmocapofficial-rgb/FBTUnrealKit-Public). FBT Unreal Kit provides Blueprint-friendly SteamVR/OpenVR tracker access, tracker role setup for waist/chest/feet/knees/elbows, calibration tools, lower-body tracking snapshots, and Control Rig/debug helpers for full-body animation workflows.
+
+## Custom Blueprint Nodes
+
+- `MocapRecorderComponent`: Blueprint-spawnable actor component that records skeletal mesh animation or actor transform motion at a configurable sample rate.
+- `Start Recording` / `Stop Recording`: Basic Blueprint nodes for standalone single-capture recording.
+- `Sample Frame`: Manually captures one frame of motion data, useful when another system controls timing.
+- `Clear Recorded Data` and `Get Recorded Frame Count`: Utility nodes for resetting a capture and checking how much data has been recorded.
+- `Start Recording External`, `Start Recording External With Pre Roll`, and `Stop Recording External`: Session-driven recording nodes for multi-actor capture where a manager controls sampling.
+- `Start Recording External Transform Only`: Records actor transform motion for non-character objects that do not need skeletal capture.
+- `MocapRecorderControlComponent`: Blueprint-spawnable helper component for managed recording, auto-resolving or creating a recorder, clearing data on start, and broadcasting recording events.
+- `Start Managed Recording`, `Stop Managed Recording`, and `Request Managed Stop`: Higher-level control nodes with stop reasons such as manual, stationary, outside radius, hit, destroyed, or invalid recorder.
+- `Is Managed Recording` and `Get Managed Recorded Frame Count`: Status nodes for UI, debugging, and capture logic.
+- Editor Blueprint Library nodes: Start/stop editor capture sessions, add selected actors, configure sample/export rates, add class/tag auto-capture rules, clear queues, and bake recordings into `AnimSequence` assets.
+
 ## UE5 Installation
 
 1. Close Unreal Engine.
