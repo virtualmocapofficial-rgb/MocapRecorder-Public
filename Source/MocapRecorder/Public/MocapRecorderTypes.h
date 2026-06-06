@@ -48,3 +48,18 @@ struct FMocapTransformFrame
     UPROPERTY()
     FTransform World = FTransform::Identity;
 };
+
+USTRUCT()
+struct FMocapRecordedVisualMeshPart
+{
+    GENERATED_BODY()
+
+    UPROPERTY()
+    FString MeshAssetPath;
+
+    UPROPERTY()
+    FTransform RelativeTransform = FTransform::Identity;
+
+    UPROPERTY()
+    FName ComponentName = NAME_None;
+};

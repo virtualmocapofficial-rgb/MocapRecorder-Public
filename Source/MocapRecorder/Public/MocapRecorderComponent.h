@@ -61,6 +61,14 @@ public:
     UPROPERTY(Transient, BlueprintReadOnly, Category = "Mocap|Recording")
     int32 StartSampleIndex = 0;
 
+    // Session sample index at which this recorder stopped. INDEX_NONE means "derive from recorded clip length".
+    UPROPERTY(Transient, BlueprintReadOnly, Category = "Mocap|Recording")
+    int32 EndSampleIndex = INDEX_NONE;
+
+    // Total samples captured by the owning session. Used to bake every asset on one shared timeline.
+    UPROPERTY(Transient, BlueprintReadOnly, Category = "Mocap|Recording")
+    int32 SessionTotalSampleCount = 0;
+
     
     UMocapRecorderComponent();
 
@@ -121,6 +129,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mocap|Bake")
     bool bPreserveSourceSampleRateOnBake = false;
 
+    /** True when recording stopped as part of actor destruction; exported clips use this to hide at the final frame. */
+    UPROPERTY(Transient, BlueprintReadOnly, Category = "Mocap|Recording")
+    bool bActorWasDestroyedOnStop = false;
+
     /** Create a transient snapshot containing recorded data for post-PIE baking. */
     UMocapRecorderComponent* CreateBakeSnapshot() const;
     
@@ -134,11 +146,9 @@ public:
 
    
     /** Start recording without creating internal timers (session manager drives SampleFrame). */
-    UFUNCTION(BlueprintCallable, Category = "Mocap|Session")
     void StartRecording_External();
 
     /** Start recording for transform-only actors (bullets/casings). */
-    UFUNCTION(BlueprintCallable, Category = "Mocap|Session")
     void StartRecording_ExternalTransformOnly(int32 InStartSampleIndex);
 
     /**
@@ -146,25 +156,23 @@ public:
      * Example: if the bullet spawns 120 samples into the session, pass PreRollFrames=120 so it stays
      * static until its real motion begins.
      */
-    UFUNCTION(BlueprintCallable, Category = "Mocap|Session")
     void StartRecording_ExternalWithPreRoll(int32 PreRollFrames);
 
     /** Stop recording without touching internal timers (session manager owns timer). */
-    UFUNCTION(BlueprintCallable, Category = "Mocap|Session")
-    void StopRecording_External();
+    void StopRecording_External(bool bActorIsDestroyed = false);
 
 
     // =====================================================
     // Control (single-capture)
     // =====================================================
 
-    /** Begin recording (standalone mode) */
-    UFUNCTION(BlueprintCallable, Category = "Mocap")
-    void StartRecording();
+    /** Begin recording. If Transform Only is true, records the owning actor transform without requiring a skeletal mesh. */
+    UFUNCTION(BlueprintCallable, Category = "Mocap", meta = (DisplayName = "Start Recording"))
+    void StartRecording(bool bInTransformOnly = false);
 
-    /** Stop recording (standalone mode) */
-    UFUNCTION(BlueprintCallable, Category = "Mocap")
-    void StopRecording();
+    /** Stop recording. If Actor Is Destroyed is true, a final hidden frame is recorded before stopping. */
+    UFUNCTION(BlueprintCallable, Category = "Mocap", meta = (DisplayName = "Stop Recording"))
+    void StopRecording(bool bActorIsDestroyed = false);
 
     /** True while recording */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mocap")
@@ -196,6 +204,8 @@ public:
     float GetRecordedSampleRate() const { return SampleRate; }
     USkeleton* GetRecordedSkeleton() const { return RecordedSkeleton; }
     USkeletalMesh* GetRecordedMeshAsset() const { return RecordedMeshAsset; }
+    const FString& GetRecordedSourceMeshAssetPath() const { return RecordedSourceMeshAssetPath; }
+    const TArray<FMocapRecordedVisualMeshPart>& GetRecordedVisualMeshParts() const { return RecordedVisualMeshParts; }
     const TArray<TObjectPtr<UMaterialInterface>>& GetRecordedMaterialOverrides() const { return RecordedMaterialOverrides; }
 
     /**
@@ -217,6 +227,7 @@ protected:
     ) override;
 
 private:
+    void AppendDestroyedStopFrame();
 
     /*Keeps it BlueprintReadOnly &
     Force Writes Through Set Session Origin*/
@@ -279,6 +290,14 @@ private:
     /** Mesh asset used during recording */
     UPROPERTY()
     TObjectPtr<USkeletalMesh> RecordedMeshAsset = nullptr;
+
+    /** Static or skeletal mesh path used to visually represent transform-only recordings in grouped exports. */
+    UPROPERTY()
+    FString RecordedSourceMeshAssetPath;
+
+    /** Static mesh component parts captured from transform-only actors for grouped exports. */
+    UPROPERTY()
+    TArray<FMocapRecordedVisualMeshPart> RecordedVisualMeshParts;
 
     /** Material overrides captured from the source skeletal mesh component at record time. */
     UPROPERTY()

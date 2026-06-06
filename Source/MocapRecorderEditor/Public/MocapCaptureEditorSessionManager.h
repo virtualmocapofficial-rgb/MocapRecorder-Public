@@ -15,6 +15,13 @@ class UAnimSequence;
 
 struct FHitResult;
 
+UENUM()
+enum class EMocapGroupedExportFormat : uint8
+{
+    FBX,
+    GLTF
+};
+
 
 /**
  * Editor-only target record used by Slate/UI.
@@ -128,6 +135,8 @@ struct FMocapInstanceState
     bool bStopRequested = false;
     // Session frame index when this actor was spawned/capture-started
     int32 SpawnSampleIndex = 0;
+    // Session frame index when this actor stopped or was destroyed.
+    int32 EndSampleIndex = INDEX_NONE;
     bool bTransformOnly = false;
     // transform-only (no skeleton)
     EMocapCaptureMode CaptureMode = EMocapCaptureMode::Skeletal;
@@ -200,6 +209,7 @@ public:
     void SetAssetPath(const FString& InPath) { AssetPath = InPath; }
     void SetAutoBakeOnStop(bool bIn) { bAutoBakeOnStop = bIn; }
     void SetExportGroupedSceneFbx(bool bIn) { bExportGroupedSceneFbx = bIn; }
+    void SetGroupedExportFormat(EMocapGroupedExportFormat InFormat) { GroupedExportFormat = InFormat; }
     void SetGroupedExportRootDirectory(const FString& InDirectory) { GroupedExportRootDirectory = InDirectory; }
     void SetGroupedExportBatchName(const FString& InBatchName) { GroupedExportBatchName = InBatchName; }
     void SetClassRuleExportFolder(int32 Index, const FString& InFolder);
@@ -210,6 +220,7 @@ public:
     const FString& GetAssetPath() const { return AssetPath; }
     bool GetAutoBakeOnStop() const { return bAutoBakeOnStop; }
     bool GetExportGroupedSceneFbx() const { return bExportGroupedSceneFbx; }
+    EMocapGroupedExportFormat GetGroupedExportFormat() const { return GroupedExportFormat; }
     const FString& GetGroupedExportRootDirectory() const { return GroupedExportRootDirectory; }
     const FString& GetGroupedExportBatchName() const { return GroupedExportBatchName; }
 
@@ -258,6 +269,7 @@ private:
         {
             TStrongObjectPtr<UMocapRecorderComponent> RecorderSnapshot;
             FString ItemName;
+            FString SourceMeshAssetPath;
         };
 
         // Snapshot that survives PIE teardown
@@ -266,6 +278,9 @@ private:
         FString RelativeExportFolder;
         FString ExportGroupName;
         FString ExportItemName;
+        int32 StartSampleIndex = 0;
+        int32 EndSampleIndex = INDEX_NONE;
+        int32 SessionTotalSampleCount = 0;
         bool bPreserveSourceSampleRate = false;
         bool bIsGroupedSceneExport = false;
         bool bUseNormalSingleFbxExport = false;
@@ -308,6 +323,7 @@ private:
     FString AssetPath = TEXT("/Game/MocapCaptures");
     bool bAutoBakeOnStop = true;
     bool bExportGroupedSceneFbx = false;
+    EMocapGroupedExportFormat GroupedExportFormat = EMocapGroupedExportFormat::FBX;
     FString GroupedExportRootDirectory;
     FString GroupedExportBatchName;
     FString ActiveBatchExportName;
@@ -373,7 +389,7 @@ private:
     FString GetPresetFilePath(const FString& PresetName) const;
     bool ResolveExportGroupForSnapshot(UMocapRecorderComponent* Snapshot, const FString& FallbackName, FString& OutGroupName, FString& OutFolderName) const;
     void CaptureBatchExportSnapshotFromJob(const FMocapBakeJob& Job);
-    void CaptureBatchExportSnapshot(UMocapRecorderComponent* Snapshot, const FString& GroupName, const FString& FolderName, const FString& ItemName);
+    void CaptureBatchExportSnapshot(UMocapRecorderComponent* Snapshot, const FString& GroupName, const FString& FolderName, const FString& ItemName, const FString& SourceMeshAssetPath = FString());
     bool ExportGroupedSceneFbx(const FMocapBakeJob& Job);
     bool ExportNormalSingleFbx(const FMocapBakeJob& Job);
     bool ExportBakedAnimAssetFbx(UAnimSequence* Anim, const FMocapBakeJob& Job);

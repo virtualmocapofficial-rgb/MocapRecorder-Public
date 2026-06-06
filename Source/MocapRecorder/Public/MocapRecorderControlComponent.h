@@ -119,11 +119,11 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Mocap")
     bool ResolveRecorderComponent();
 
-    UFUNCTION(BlueprintCallable, Category = "Mocap")
-    bool StartManagedRecording();
+    UFUNCTION(BlueprintCallable, Category = "Mocap", meta = (DisplayName = "Start Managed Recording"))
+    bool StartManagedRecording(bool bTransformOnly = false);
 
-    UFUNCTION(BlueprintCallable, Category = "Mocap")
-    void StopManagedRecording();
+    UFUNCTION(BlueprintCallable, Category = "Mocap", meta = (DisplayName = "Stop Managed Recording"))
+    void StopManagedRecording(bool bActorIsDestroyed = false);
 
     UFUNCTION(BlueprintCallable, Category = "Mocap")
     void RequestManagedStop(EMocapRecorderStopReason Reason);
@@ -146,7 +146,7 @@ private:
     void EvaluateAutoStop(float DeltaTime);
     bool ShouldStopForRadius() const;
     AActor* ResolveRadiusReferenceActor() const;
-    void StopManagedRecordingInternal(EMocapRecorderStopReason Reason);
+    void StopManagedRecordingInternal(EMocapRecorderStopReason Reason, bool bActorIsDestroyed = false);
 
 private:
     FVector LastLocation = FVector::ZeroVector;

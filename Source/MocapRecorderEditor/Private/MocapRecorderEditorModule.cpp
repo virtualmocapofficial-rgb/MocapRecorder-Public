@@ -390,10 +390,28 @@ UAnimSequence* FMocapRecorderEditorModule::BakeAnimSequenceFromRecorder(
 
     const double SrcDt = 1.0 / (double)SourceFPS;
     const double OutDt = 1.0 / (double)BakeFPS;
+    const int32 PlayableSourceFrameCount = Recorder->bActorWasDestroyedOnStop && Frames.Num() > 1
+        ? Frames.Num() - 1
+        : Frames.Num();
 
-    const int32 OutFrames = bPreserveSourceSampleRate
-        ? Frames.Num()
-        : FMath::Max(1, (int32)FMath::FloorToInt(((Frames.Num() - 1) * SrcDt) / OutDt) + 1);
+    const int32 RecordedOutFrames = bPreserveSourceSampleRate
+        ? PlayableSourceFrameCount
+        : FMath::Max(1, (int32)FMath::FloorToInt(((PlayableSourceFrameCount - 1) * SrcDt) / OutDt) + 1);
+    const int32 StartFrameOffset = FMath::Max(0, FMath::RoundToInt(
+        (static_cast<double>(FMath::Max(0, Recorder->StartSampleIndex)) / static_cast<double>(SourceFPS)) * static_cast<double>(BakeFPS)));
+    const int32 RawEndSampleIndex = Recorder->EndSampleIndex != INDEX_NONE
+        ? FMath::Max(Recorder->StartSampleIndex, Recorder->EndSampleIndex)
+        : Recorder->StartSampleIndex + FMath::Max(0, Frames.Num() - 1);
+    const int32 EndFrameOffset = FMath::Max(StartFrameOffset, FMath::RoundToInt(
+        (static_cast<double>(RawEndSampleIndex) / static_cast<double>(SourceFPS)) * static_cast<double>(BakeFPS)));
+    const int32 SessionOutFrames = Recorder->SessionTotalSampleCount > 0
+        ? FMath::Max(1, FMath::CeilToInt(
+            (static_cast<double>(FMath::Max(0, Recorder->SessionTotalSampleCount - 1)) / static_cast<double>(SourceFPS)) * static_cast<double>(BakeFPS)) + 1)
+        : 0;
+    const bool bBakeSharedSessionTimeline = Recorder->SessionTotalSampleCount > 0;
+    const int32 OutFrames = bBakeSharedSessionTimeline
+        ? FMath::Max3(SessionOutFrames, StartFrameOffset + RecordedOutFrames, EndFrameOffset + 2)
+        : RecordedOutFrames;
     const int32 SequenceFrameCount = FMath::Max(0, OutFrames - 1);
 
     UAnimSequenceFactory* Factory = NewObject<UAnimSequenceFactory>();
@@ -411,6 +429,15 @@ UAnimSequence* FMocapRecorderEditorModule::BakeAnimSequenceFromRecorder(
 
     if (!IsValid(Anim))
         return nullptr;
+
+    if (USkeletalMesh* PreviewMesh = Recorder->GetRecordedMeshAsset())
+    {
+        Anim->SetPreviewMesh(PreviewMesh, false);
+    }
+    else if (IsValid(Skeleton))
+    {
+        Anim->SetPreviewMesh(Skeleton->GetPreviewMesh(false), false);
+    }
 
     IAnimationDataController& Controller = Anim->GetController();
     Controller.OpenBracket(LOCTEXT("Bake", "Mocap Bake"));
@@ -440,15 +467,23 @@ UAnimSequence* FMocapRecorderEditorModule::BakeAnimSequenceFromRecorder(
 
         for (int32 OutIdx = 0; OutIdx < OutFrames; ++OutIdx)
         {
+            const int32 RecordedTimelineFrame = bBakeSharedSessionTimeline
+                ? FMath::Max(0, OutIdx - StartFrameOffset)
+                : OutIdx;
             const int32 SrcIdx = bPreserveSourceSampleRate
-                ? OutIdx
-                : FMath::Clamp((int32)FMath::RoundToInt((OutIdx * OutDt) / SrcDt), 0, Frames.Num() - 1);
+                ? FMath::Clamp(RecordedTimelineFrame, 0, PlayableSourceFrameCount - 1)
+                : FMath::Clamp((int32)FMath::RoundToInt((RecordedTimelineFrame * OutDt) / SrcDt), 0, PlayableSourceFrameCount - 1);
 
             const FMocapFrame& F = Frames[SrcIdx];
 
             Pos[OutIdx] = FVector3f(F.Translations.IsValidIndex(BoneIdx) ? F.Translations[BoneIdx] : FVector::ZeroVector);
             Rot[OutIdx] = FQuat4f(F.Rotations.IsValidIndex(BoneIdx) ? F.Rotations[BoneIdx] : FQuat::Identity);
             Scale[OutIdx] = FVector3f(F.Scales.IsValidIndex(BoneIdx) ? F.Scales[BoneIdx] : FVector::OneVector);
+
+            if (bBakeSharedSessionTimeline && BoneIdx == 0 && (OutIdx < StartFrameOffset || OutIdx > EndFrameOffset))
+            {
+                Scale[OutIdx] = FVector3f(0.001f, 0.001f, 0.001f);
+            }
         }
 
         Controller.SetBoneTrackKeys(BoneName, Pos, Rot, Scale);
@@ -464,13 +499,17 @@ UAnimSequence* FMocapRecorderEditorModule::BakeAnimSequenceFromRecorder(
     FAssetRegistryModule::AssetCreated(Anim);
 
     UE_LOG(LogTemp, Warning,
-        TEXT("Bake SUCCESS: %s (Keys=%d SequenceFrames=%d BakeFPS=%d SourceFPS=%d PreserveSource=%s)"),
+        TEXT("Bake SUCCESS: %s (Keys=%d SequenceFrames=%d BakeFPS=%d SourceFPS=%d PreserveSource=%s SharedTimeline=%d StartFrame=%d EndFrame=%d SessionSamples=%d)"),
         *Anim->GetPathName(),
         OutFrames,
         SequenceFrameCount,
         BakeFPS,
         SourceFPS,
-        bPreserveSourceSampleRate ? TEXT("true") : TEXT("false"));
+        bPreserveSourceSampleRate ? TEXT("true") : TEXT("false"),
+        bBakeSharedSessionTimeline ? 1 : 0,
+        StartFrameOffset,
+        EndFrameOffset,
+        Recorder->SessionTotalSampleCount);
 
     return Anim;
 }
@@ -536,6 +575,14 @@ UAnimSequence* FMocapRecorderEditorModule::CreateTransientAnimSequenceFromRecord
         return nullptr;
 
     Anim->SetSkeleton(Skeleton);
+    if (USkeletalMesh* PreviewMesh = Recorder->GetRecordedMeshAsset())
+    {
+        Anim->SetPreviewMesh(PreviewMesh, false);
+    }
+    else if (IsValid(Skeleton))
+    {
+        Anim->SetPreviewMesh(Skeleton->GetPreviewMesh(false), false);
+    }
 
     IAnimationDataController& Controller = Anim->GetController();
     Controller.OpenBracket(LOCTEXT("Bake", "Mocap Bake"));

@@ -58,6 +58,9 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Mocap|Editor", meta = (WorldContext = "WorldContextObject"))
     static void SetMocapClassRuleAutoStopSettings(UObject* WorldContextObject, int32 RuleIndex, FMocapAutoStopSettings AutoStopSettings);
 
+    UFUNCTION(BlueprintCallable, Category = "Mocap|Editor", meta = (WorldContext = "WorldContextObject", DisplayName = "Set Mocap Class Rule Transform Only"))
+    static void SetMocapClassRuleTransformOnly(UObject* WorldContextObject, int32 RuleIndex, bool bTransformOnly);
+
     UFUNCTION(BlueprintCallable, Category = "Mocap|Editor", meta = (WorldContext = "WorldContextObject"))
     static void RemoveMocapClassRule(UObject* WorldContextObject, int32 RuleIndex);
 

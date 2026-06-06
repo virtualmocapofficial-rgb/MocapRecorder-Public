@@ -66,6 +66,8 @@ private:
     TSharedPtr<SListView<TSharedPtr<int32>>> TargetListView;
     TArray<TSharedPtr<FString>> PresetItems;
     TSharedPtr<SComboBox<TSharedPtr<FString>>> PresetComboBox;
+    TArray<TSharedPtr<FString>> ExportFormatItems;
+    TSharedPtr<SComboBox<TSharedPtr<FString>>> ExportFormatComboBox;
     FString PresetNameToSave;
     FString SelectedPresetName;
         

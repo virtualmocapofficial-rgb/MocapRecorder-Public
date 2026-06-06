@@ -39,6 +39,7 @@ public class MocapRecorderEditor : ModuleRules
                 "EditorFramework",
                 "LevelEditor",
                 "LevelSequence",
+                "GLTFExporter",
                 "MovieScene",
                 "MovieSceneTracks",
                 "MovieSceneTools"

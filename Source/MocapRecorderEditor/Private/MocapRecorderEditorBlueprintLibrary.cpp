@@ -176,6 +176,14 @@ void UMocapRecorderEditorBlueprintLibrary::SetMocapClassRuleAutoStopSettings(UOb
     }
 }
 
+void UMocapRecorderEditorBlueprintLibrary::SetMocapClassRuleTransformOnly(UObject* WorldContextObject, int32 RuleIndex, bool bTransformOnly)
+{
+    if (UMocapCaptureEditorSessionManager* SessionManager = ResolveSessionManager(WorldContextObject))
+    {
+        SessionManager->SetClassRuleTransformOnly(RuleIndex, bTransformOnly);
+    }
+}
+
 void UMocapRecorderEditorBlueprintLibrary::RemoveMocapClassRule(UObject* WorldContextObject, int32 RuleIndex)
 {
     if (UMocapCaptureEditorSessionManager* SessionManager = ResolveSessionManager(WorldContextObject))

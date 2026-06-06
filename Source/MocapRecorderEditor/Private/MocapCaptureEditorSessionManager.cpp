@@ -62,6 +62,8 @@
 #include "CinematicExporter.h"
 #include "Exporters/FbxExportOption.h"
 #include "FbxExporter.h"
+#include "Exporters/GLTFExporter.h"
+#include "Options/GLTFExportOptions.h"
 
 // Forward declaration
 static bool ExportMeshAssetToFbx_IfMissing(const FString& MeshAssetPath, FString& OutMeshFbxPath);
@@ -319,6 +321,52 @@ FTransform GetRecordedObjectTransformAtFrame(const UMocapRecorderComponent* Snap
     return FTransform::Identity;
 }
 
+int32 GetRecordedTimelineFrameCount(const UMocapRecorderComponent* Snapshot)
+{
+    if (!IsValid(Snapshot))
+    {
+        return 0;
+    }
+
+    return FMath::Max(Snapshot->GetRecordedFrames().Num(), Snapshot->GetRecordedTransformFrames().Num());
+}
+
+bool IsVisibleObjectScale(const FVector& Scale)
+{
+    constexpr double HiddenScaleThreshold = 0.01;
+    return Scale.GetAbsMax() > HiddenScaleThreshold;
+}
+
+void FindRecordedVisibleSourceRange(const UMocapRecorderComponent* Snapshot, int32 SourceFrameCount, int32& OutFirstVisibleSourceFrame, int32& OutLastVisibleSourceFrame)
+{
+    OutFirstVisibleSourceFrame = 0;
+    OutLastVisibleSourceFrame = FMath::Max(0, SourceFrameCount - 1);
+    if (!IsValid(Snapshot) || SourceFrameCount <= 0)
+    {
+        return;
+    }
+
+    int32 FirstVisible = INDEX_NONE;
+    int32 LastVisible = INDEX_NONE;
+    for (int32 SourceFrameIndex = 0; SourceFrameIndex < SourceFrameCount; ++SourceFrameIndex)
+    {
+        if (IsVisibleObjectScale(GetRecordedObjectTransformAtFrame(Snapshot, SourceFrameIndex).GetScale3D()))
+        {
+            if (FirstVisible == INDEX_NONE)
+            {
+                FirstVisible = SourceFrameIndex;
+            }
+            LastVisible = SourceFrameIndex;
+        }
+    }
+
+    if (FirstVisible != INDEX_NONE)
+    {
+        OutFirstVisibleSourceFrame = FirstVisible;
+        OutLastVisibleSourceFrame = LastVisible;
+    }
+}
+
 void AddTransformKey(FMovieSceneDoubleChannel* Channel, FFrameNumber FrameNumber, double Value)
 {
     if (Channel)
@@ -444,6 +492,35 @@ void UMocapCaptureEditorSessionManager::OnEndPIE(const bool bIsSimulating)
 {
     // IMPORTANT: do NOT early-return just because bIsRecording is false.
     // We may have deferred baking during PIE and need to kick it now.
+
+    int32 ExternalTimelineJobsUpdated = 0;
+    for (FMocapBakeJob& Job : PendingBakeJobs)
+    {
+        UMocapRecorderComponent* Snapshot = Job.RecorderSnapshot.Get();
+        if (!IsValid(Snapshot))
+        {
+            continue;
+        }
+
+        Job.StartSampleIndex = FMath::Max(0, Snapshot->StartSampleIndex);
+        Job.EndSampleIndex = Snapshot->EndSampleIndex != INDEX_NONE
+            ? FMath::Max(Job.StartSampleIndex, Snapshot->EndSampleIndex)
+            : Job.StartSampleIndex + FMath::Max(0, GetRecordedTimelineFrameCount(Snapshot) - 1);
+
+        const int32 WorldTimelineSamples = (GEditor && GEditor->PlayWorld)
+            ? FMath::Max(1, FMath::RoundToInt(GEditor->PlayWorld->GetTimeSeconds() * FMath::Max(1.f, Snapshot->GetRecordedSampleRate())) + 1)
+            : 0;
+        Job.SessionTotalSampleCount = FMath::Max3(Job.SessionTotalSampleCount, WorldTimelineSamples, Job.EndSampleIndex + 2);
+        Snapshot->StartSampleIndex = Job.StartSampleIndex;
+        Snapshot->EndSampleIndex = Job.EndSampleIndex;
+        Snapshot->SessionTotalSampleCount = Job.SessionTotalSampleCount;
+        ++ExternalTimelineJobsUpdated;
+    }
+
+    UE_LOG(LogMocapRecorderEditor, Warning,
+        TEXT("Session: EndPIE finalized queued bake timing Jobs=%d PlayWorldTime=%.3f"),
+        ExternalTimelineJobsUpdated,
+        (GEditor && GEditor->PlayWorld) ? GEditor->PlayWorld->GetTimeSeconds() : -1.f);
 
     TickBakeQueue(0.f);
 
@@ -718,14 +795,16 @@ void UMocapCaptureEditorSessionManager::SetClassRuleTransformOnly(int32 Index, b
     if (!ClassRules.IsValidIndex(Index))
         return;
 
-    // Skeletal-only policy: transform-only is not supported.
-    ClassRules[Index].bTransformOnly = false;
-    ClassRules[Index].bRequireSkeletalMesh = true;
-    ClassRules[Index].CaptureMode = EMocapCaptureMode::Skeletal;
+    ClassRules[Index].bTransformOnly = bIn;
+    ClassRules[Index].bRequireSkeletalMesh = !bIn;
+    ClassRules[Index].CaptureMode = bIn ? EMocapCaptureMode::TransformOnly : EMocapCaptureMode::Skeletal;
 
     UE_LOG(LogMocapRecorderEditor, Warning,
-        TEXT("Rule[%d] skeletal-only policy: TransformOnly is disabled (ignoring requested=%d)."),
-        Index, bIn ? 1 : 0);
+        TEXT("Rule[%d] TransformOnly=%d CaptureMode=%s RequireSkeletalMesh=%d."),
+        Index,
+        bIn ? 1 : 0,
+        bIn ? TEXT("TransformOnly") : TEXT("Skeletal"),
+        ClassRules[Index].bRequireSkeletalMesh ? 1 : 0);
 }
 
 void UMocapCaptureEditorSessionManager::SetRule_StopWhenNearlyStationary(int32 Index, bool bIn)
@@ -847,6 +926,7 @@ bool UMocapCaptureEditorSessionManager::SavePreset(const FString& PresetName) co
     Root->SetStringField(TEXT("AssetPath"), AssetPath);
     Root->SetBoolField(TEXT("AutoBakeOnStop"), bAutoBakeOnStop);
     Root->SetBoolField(TEXT("AutoExportAfterBake"), bExportGroupedSceneFbx);
+    Root->SetStringField(TEXT("GroupedExportFormat"), GroupedExportFormat == EMocapGroupedExportFormat::GLTF ? TEXT("GLTF") : TEXT("FBX"));
     Root->SetStringField(TEXT("GroupedExportRootDirectory"), GroupedExportRootDirectory);
     Root->SetStringField(TEXT("GroupedExportBatchName"), GroupedExportBatchName);
 
@@ -921,6 +1001,17 @@ bool UMocapCaptureEditorSessionManager::LoadPreset(const FString& PresetName)
     AssetPath = Root->GetStringField(TEXT("AssetPath"));
     bAutoBakeOnStop = Root->GetBoolField(TEXT("AutoBakeOnStop"));
     bExportGroupedSceneFbx = Root->GetBoolField(TEXT("AutoExportAfterBake"));
+    FString GroupedExportFormatText;
+    if (Root->TryGetStringField(TEXT("GroupedExportFormat"), GroupedExportFormatText))
+    {
+        GroupedExportFormat = (GroupedExportFormatText.Equals(TEXT("GLTF"), ESearchCase::IgnoreCase) || GroupedExportFormatText.Equals(TEXT("GLB"), ESearchCase::IgnoreCase))
+            ? EMocapGroupedExportFormat::GLTF
+            : EMocapGroupedExportFormat::FBX;
+    }
+    else
+    {
+        GroupedExportFormat = EMocapGroupedExportFormat::FBX;
+    }
     GroupedExportRootDirectory = Root->GetStringField(TEXT("GroupedExportRootDirectory"));
     GroupedExportBatchName = Root->GetStringField(TEXT("GroupedExportBatchName"));
 
@@ -985,6 +1076,16 @@ void UMocapCaptureEditorSessionManager::EnqueueBakeSnapshot(UMocapRecorderCompon
 
     FMocapBakeJob Job;
     Job.RecorderSnapshot = TStrongObjectPtr<UMocapRecorderComponent>(Snapshot);
+    Job.StartSampleIndex = Snapshot->StartSampleIndex;
+    Job.EndSampleIndex = Snapshot->EndSampleIndex;
+    const int32 WorldTimelineSamples = (GEditor && GEditor->PlayWorld)
+        ? FMath::Max(1, FMath::RoundToInt(GEditor->PlayWorld->GetTimeSeconds() * FMath::Max(1.f, Snapshot->GetRecordedSampleRate())) + 1)
+        : 0;
+    Job.SessionTotalSampleCount = FMath::Max3(
+        Snapshot->SessionTotalSampleCount,
+        WorldTimelineSamples,
+        Job.EndSampleIndex != INDEX_NONE ? Job.EndSampleIndex + 2 : Job.StartSampleIndex + GetRecordedTimelineFrameCount(Snapshot) + 1);
+    Snapshot->SessionTotalSampleCount = Job.SessionTotalSampleCount;
     Job.AssetName = MakeUniqueBakeAssetName(AssetName.IsEmpty() ? TEXT("Baked_Actor") : AssetName);
     Job.bPreserveSourceSampleRate = bInPreserveSourceSampleRate;
 
@@ -1046,7 +1147,7 @@ bool UMocapCaptureEditorSessionManager::ResolveExportGroupForSnapshot(UMocapReco
     return false;
 }
 
-void UMocapCaptureEditorSessionManager::CaptureBatchExportSnapshot(UMocapRecorderComponent* Snapshot, const FString& GroupName, const FString& FolderName, const FString& ItemName)
+void UMocapCaptureEditorSessionManager::CaptureBatchExportSnapshot(UMocapRecorderComponent* Snapshot, const FString& GroupName, const FString& FolderName, const FString& ItemName, const FString& SourceMeshAssetPath)
 {
     if (!IsValid(Snapshot))
     {
@@ -1078,13 +1179,15 @@ void UMocapCaptureEditorSessionManager::CaptureBatchExportSnapshot(UMocapRecorde
     FMocapBakeJob::FMocapSceneExportItem& Item = ExistingJob->SceneItems.AddDefaulted_GetRef();
     Item.RecorderSnapshot = TStrongObjectPtr<UMocapRecorderComponent>(Snapshot);
     Item.ItemName = SanitizeBakeNameFragment(ItemName.IsEmpty() ? TEXT("Actor") : ItemName);
+    Item.SourceMeshAssetPath = SourceMeshAssetPath;
 
     UE_LOG(LogMocapRecorderEditor, Warning,
-        TEXT("ExportQueue: Group '%s' Folder='%s' now has %d item(s). Added=%s"),
+        TEXT("ExportQueue: Group '%s' Folder='%s' now has %d item(s). Added=%s SourceMesh=%s"),
         *ExistingJob->AssetName,
         *ExistingJob->RelativeExportFolder,
         ExistingJob->SceneItems.Num(),
-        *Item.ItemName);
+        *Item.ItemName,
+        Item.SourceMeshAssetPath.IsEmpty() ? TEXT("<none>") : *Item.SourceMeshAssetPath);
 }
 
 void UMocapCaptureEditorSessionManager::CaptureBatchExportSnapshotFromJob(const FMocapBakeJob& Job)
@@ -1106,7 +1209,8 @@ void UMocapCaptureEditorSessionManager::CaptureBatchExportSnapshotFromJob(const 
         Snapshot,
         GroupName,
         FolderName,
-        Job.ExportItemName.IsEmpty() ? Job.AssetName : Job.ExportItemName);
+        Job.ExportItemName.IsEmpty() ? Job.AssetName : Job.ExportItemName,
+        Snapshot->GetRecordedSourceMeshAssetPath());
 }
 
 // ------------------------------------------------------------
@@ -1225,6 +1329,9 @@ bool UMocapCaptureEditorSessionManager::StartSession()
         if (!IsValid(Recorder))
             continue;
 
+        Recorder->StartSampleIndex = 0;
+        Recorder->EndSampleIndex = INDEX_NONE;
+        Recorder->SessionTotalSampleCount = 0;
         Recorder->StartRecording_External();
         T.Recorder = Recorder;
         ++StartedManual;
@@ -1288,6 +1395,7 @@ void UMocapCaptureEditorSessionManager::StopSession()
         // Stop recording if still active
         if (Recorder->bIsRecording)
         {
+            Recorder->EndSampleIndex = FMath::Max(Recorder->StartSampleIndex, SessionSampleCounter);
             Recorder->StopRecording_External();
         }
 
@@ -1307,6 +1415,8 @@ void UMocapCaptureEditorSessionManager::StopSession()
             {
                 FMocapBakeJob Job;
                 Job.RecorderSnapshot = TStrongObjectPtr<UMocapRecorderComponent>(Snapshot);
+                Job.StartSampleIndex = Snapshot->StartSampleIndex;
+                Job.EndSampleIndex = Snapshot->EndSampleIndex;
                 Job.bPreserveSourceSampleRate = bPreserveSourceSampleRate;
 
                 Job.AssetName =
@@ -1325,7 +1435,8 @@ void UMocapCaptureEditorSessionManager::StopSession()
                     Snapshot,
                     FString(),
                     TEXT("Miscellaneous"),
-                    Recorder->GetOwner() ? Recorder->GetOwner()->GetName() : TEXT("Actor"));
+                    Recorder->GetOwner() ? Recorder->GetOwner()->GetName() : TEXT("Actor"),
+                    Snapshot->GetRecordedSourceMeshAssetPath());
 
                 UE_LOG(LogMocapRecorderEditor, Warning,
                     TEXT("StopSession: Added bake job (manual). PendingBakeJobs=%d"),
@@ -1356,6 +1467,8 @@ void UMocapCaptureEditorSessionManager::StopSession()
 
         if (Recorder->bIsRecording)
         {
+            S.EndSampleIndex = FMath::Max(S.SpawnSampleIndex, SessionSampleCounter);
+            Recorder->EndSampleIndex = S.EndSampleIndex;
             Recorder->StopRecording_External();
         }
 
@@ -1375,6 +1488,8 @@ void UMocapCaptureEditorSessionManager::StopSession()
             {
                 FMocapBakeJob Job;
                 Job.RecorderSnapshot = TStrongObjectPtr<UMocapRecorderComponent>(Snapshot);
+                Job.StartSampleIndex = Snapshot->StartSampleIndex;
+                Job.EndSampleIndex = Snapshot->EndSampleIndex;
                 Job.bPreserveSourceSampleRate = bPreserveSourceSampleRate;
 
                 Job.AssetName =
@@ -1393,7 +1508,8 @@ void UMocapCaptureEditorSessionManager::StopSession()
                     Snapshot,
                     MakeBakeGroupName(S, Recorder->GetOwner()),
                     S.ExportFolder,
-                    Recorder->GetOwner() ? Recorder->GetOwner()->GetName() : TEXT("Actor"));
+                    Recorder->GetOwner() ? Recorder->GetOwner()->GetName() : TEXT("Actor"),
+                    S.SourceMeshAssetPath);
 
                 UE_LOG(LogMocapRecorderEditor, Warning,
                     TEXT("StopSession: Added bake job (auto). PendingBakeJobs=%d"),
@@ -1403,6 +1519,63 @@ void UMocapCaptureEditorSessionManager::StopSession()
 
         // If these recorder components were dynamically created for auto-capture, clean them up.
         Recorder->DestroyComponent();
+    }
+
+    const int32 FinalSessionSampleCount = FMath::Max(1, SessionSampleCounter + 1);
+    for (FMocapBakeJob& Job : PendingBakeJobs)
+    {
+        Job.SessionTotalSampleCount = FinalSessionSampleCount;
+        if (UMocapRecorderComponent* Snapshot = Job.RecorderSnapshot.Get())
+        {
+            Snapshot->SessionTotalSampleCount = FinalSessionSampleCount;
+            Job.StartSampleIndex = Snapshot->StartSampleIndex;
+            Job.EndSampleIndex = Snapshot->EndSampleIndex;
+        }
+    }
+    for (TPair<FString, FMocapBakeJob>& Pair : PendingBatchExportJobs)
+    {
+        for (FMocapBakeJob::FMocapSceneExportItem& Item : Pair.Value.SceneItems)
+        {
+            if (UMocapRecorderComponent* Snapshot = Item.RecorderSnapshot.Get())
+            {
+                Snapshot->SessionTotalSampleCount = FinalSessionSampleCount;
+            }
+        }
+    }
+    UE_LOG(LogMocapRecorderEditor, Warning,
+        TEXT("StopSession: Applied shared bake timeline TotalSamples=%d BakeJobs=%d ExportGroups=%d"),
+        FinalSessionSampleCount,
+        PendingBakeJobs.Num(),
+        PendingBatchExportJobs.Num());
+
+    {
+        FString AuditJson = TEXT("{\n");
+        AuditJson += FString::Printf(TEXT("  \"sessionTotalSamples\": %d,\n"), FinalSessionSampleCount);
+        AuditJson += TEXT("  \"bakeJobs\": [\n");
+        for (int32 JobIndex = 0; JobIndex < PendingBakeJobs.Num(); ++JobIndex)
+        {
+            const FMocapBakeJob& Job = PendingBakeJobs[JobIndex];
+            const UMocapRecorderComponent* Snapshot = Job.RecorderSnapshot.Get();
+            AuditJson += TEXT("    {\n");
+            AuditJson += FString::Printf(TEXT("      \"asset\": \"%s\",\n"), *JsonEscape(Job.AssetName));
+            AuditJson += FString::Printf(TEXT("      \"jobStartSample\": %d,\n"), Job.StartSampleIndex);
+            AuditJson += FString::Printf(TEXT("      \"jobEndSample\": %d,\n"), Job.EndSampleIndex);
+            AuditJson += FString::Printf(TEXT("      \"jobSessionTotalSamples\": %d,\n"), Job.SessionTotalSampleCount);
+            AuditJson += FString::Printf(TEXT("      \"snapshotStartSample\": %d,\n"), Snapshot ? Snapshot->StartSampleIndex : INDEX_NONE);
+            AuditJson += FString::Printf(TEXT("      \"snapshotEndSample\": %d,\n"), Snapshot ? Snapshot->EndSampleIndex : INDEX_NONE);
+            AuditJson += FString::Printf(TEXT("      \"snapshotSessionTotalSamples\": %d\n"), Snapshot ? Snapshot->SessionTotalSampleCount : 0);
+            AuditJson += JobIndex + 1 < PendingBakeJobs.Num() ? TEXT("    },\n") : TEXT("    }\n");
+        }
+        AuditJson += TEXT("  ]\n}\n");
+
+        const FString AuditRoot = GroupedExportRootDirectory.IsEmpty()
+            ? FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MocapExports"))
+            : GroupedExportRootDirectory;
+        const FString AuditDir = FPaths::Combine(AuditRoot, SanitizeBakeNameFragment(ActiveBatchExportName));
+        FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*AuditDir);
+        const FString AuditPath = FPaths::Combine(AuditDir, TEXT("BakeTimingAudit.json"));
+        FFileHelper::SaveStringToFile(AuditJson, *AuditPath);
+        UE_LOG(LogMocapRecorderEditor, Warning, TEXT("StopSession: Wrote bake timing audit -> %s"), *AuditPath);
     }
 
     // ------------------------------------------------------------
@@ -1429,8 +1602,12 @@ void UMocapCaptureEditorSessionManager::SampleAll()
     if (!bIsRecording)
         return;    
 
-    // Deterministic discovery: if spawn hook misses, we still capture everything.
-    SweepWorldForAutoCapture(SweepBudgetPerTick);
+    // Use spawn events for timing when available. Sweeping while the spawn hook is active can
+    // pre-capture pooled/pre-existing actors at sample 0, which collapses staggered exports.
+    if (!ActorSpawnedHandle.IsValid())
+    {
+        SweepWorldForAutoCapture(SweepBudgetPerTick);
+    }
     ProcessPendingAutoCaptures(MaxAutoCapturePerTick);
 
     int32 Processed = 0;
@@ -1499,22 +1676,12 @@ void UMocapCaptureEditorSessionManager::OnActorSpawned(AActor* SpawnedActor)
         return;
     }
 
-    // Skeletal-only gate: spawned actor must have a SkeletalMeshComponent with a mesh
-    USkeletalMeshComponent* SkelComp = SpawnedActor->FindComponentByClass<USkeletalMeshComponent>();
-    if (!IsValid(SkelComp) || !IsValid(SkelComp->GetSkeletalMeshAsset()))
-    {
-        UE_LOG(LogMocapRecorderEditor, Warning,
-            TEXT("AutoCapture: Skipping %s (no valid SkeletalMeshComponent/SkeletalMesh)"),
-            *GetNameSafe(SpawnedActor));
-        return;
-    }
-
     UE_LOG(LogMocapRecorderEditor, Warning,
         TEXT("AutoCapture: OnActorSpawned actor=%s class=%s"),
         *GetNameSafe(SpawnedActor),
         *GetNameSafe(SpawnedActor->GetClass()));
 
-    // Match against enabled rules (no TransformOnly path)
+    // Match against enabled rules. Skeletal rules require a skeletal mesh; transform-only rules do not.
     for (const FMocapClassCaptureRule& Rule : ClassRules)
     {
         if (!Rule.bEnabled)
@@ -1538,18 +1705,24 @@ void UMocapCaptureEditorSessionManager::OnActorSpawned(AActor* SpawnedActor)
             continue;
         }
 
-        // If your UI still has this flag, enforce it here (we are skeletal-only anyway)
-        if (Rule.bRequireSkeletalMesh)
+        const bool bRuleTransformOnly = Rule.bTransformOnly || Rule.CaptureMode == EMocapCaptureMode::TransformOnly;
+        USkeletalMeshComponent* SkelComp = SpawnedActor->FindComponentByClass<USkeletalMeshComponent>();
+        if (!bRuleTransformOnly && (!IsValid(SkelComp) || !IsValid(SkelComp->GetSkeletalMeshAsset())))
         {
-            // already guaranteed above, but keep explicit for clarity
+            UE_LOG(LogMocapRecorderEditor, Warning,
+                TEXT("AutoCapture: Rule matched %s but skipped skeletal capture because it has no valid SkeletalMeshComponent/SkeletalMesh."),
+                *GetNameSafe(SpawnedActor));
+            continue;
         }
 
         PendingAutoCaptureActors.Add(SpawnedActor);
+        SeenAutoCaptureActors.Add(SpawnedActor);
 
         UE_LOG(LogMocapRecorderEditor, Warning,
-            TEXT("AutoCapture: Spawn matched rule class=%s Tag=%s (Pending=%d)"),
+            TEXT("AutoCapture: Spawn matched rule class=%s Tag=%s TransformOnly=%d (Pending=%d)"),
             *GetNameSafe(RuleClass),
             *Rule.RequiredTag.ToString(),
+            bRuleTransformOnly ? 1 : 0,
             PendingAutoCaptureActors.Num());
 
         return;
@@ -1590,6 +1763,11 @@ void UMocapCaptureEditorSessionManager::ProcessPendingAutoCaptures(int32 MaxPerT
                 continue;
 
             if (Rule.RequiredTag != NAME_None && !Actor->ActorHasTag(Rule.RequiredTag))
+                continue;
+
+            const bool bRuleTransformOnly = Rule.bTransformOnly || Rule.CaptureMode == EMocapCaptureMode::TransformOnly;
+            USkeletalMeshComponent* SkelComp = Actor->FindComponentByClass<USkeletalMeshComponent>();
+            if (!bRuleTransformOnly && (!IsValid(SkelComp) || !IsValid(SkelComp->GetSkeletalMeshAsset())))
                 continue;
 
             if (!SelectedRule)
@@ -1695,11 +1873,19 @@ void UMocapCaptureEditorSessionManager::SweepWorldForAutoCapture(int32 MaxToQueu
             if (RuleClass == nullptr)
                 continue;
 
-            if (A->IsA(RuleClass))
-            {
-                MatchRule = &Rule;
-                break;
-            }
+            if (!A->IsA(RuleClass))
+                continue;
+
+            if (Rule.RequiredTag != NAME_None && !A->ActorHasTag(Rule.RequiredTag))
+                continue;
+
+            const bool bRuleTransformOnly = Rule.bTransformOnly || Rule.CaptureMode == EMocapCaptureMode::TransformOnly;
+            USkeletalMeshComponent* SkelComp = A->FindComponentByClass<USkeletalMeshComponent>();
+            if (!bRuleTransformOnly && (!IsValid(SkelComp) || !IsValid(SkelComp->GetSkeletalMeshAsset())))
+                continue;
+
+            MatchRule = &Rule;
+            break;
         }
 
         if (!MatchRule)
@@ -1726,9 +1912,9 @@ bool UMocapCaptureEditorSessionManager::TryAutoCaptureActor(AActor* Actor, const
             return false;
     }
 
-    // Skeletal-only policy: MUST have a SkeletalMeshComponent.
+    const bool bRuleTransformOnly = Rule.bTransformOnly || Rule.CaptureMode == EMocapCaptureMode::TransformOnly;
     USkeletalMeshComponent* Skel = FindFirstSkeletalMeshComponent(Actor);
-    if (!Skel)
+    if (!bRuleTransformOnly && !Skel)
         return false;
 
     UMocapRecorderComponent* Recorder = Actor->FindComponentByClass<UMocapRecorderComponent>();
@@ -1738,16 +1924,20 @@ bool UMocapCaptureEditorSessionManager::TryAutoCaptureActor(AActor* Actor, const
         Recorder->RegisterComponent();
     }
 
-    // Configure recorder (skeletal-only)
-    Recorder->TargetSkeletalMesh = Skel;
+    // Configure recorder.
+    Recorder->CaptureMode = bRuleTransformOnly ? EMocapCaptureMode::TransformOnly : EMocapCaptureMode::Skeletal;
+    Recorder->bTransformOnly = bRuleTransformOnly;
+    Recorder->TargetSkeletalMesh = bRuleTransformOnly ? nullptr : Skel;
     Recorder->SampleRate = CaptureSampleRateHz;
     Recorder->bExternalSampling = true;
     Recorder->bAutoExportOnStop = false;
 
     // IMPORTANT: set start index BEFORE starting capture
     Recorder->StartSampleIndex = SessionSampleCounter;
+    Recorder->EndSampleIndex = INDEX_NONE;
+    Recorder->SessionTotalSampleCount = 0;
 
-    // Track instance state (skeletal-only)
+    // Track instance state.
     FMocapInstanceState S;
     S.Actor = Actor;
     S.SkelComp = Skel;
@@ -1758,12 +1948,12 @@ bool UMocapCaptureEditorSessionManager::TryAutoCaptureActor(AActor* Actor, const
     S.Settings = Rule.AutoStop;
     S.BakeGroupName = Rule.BakeGroupName;
     S.ExportFolder = Rule.ExportFolder;
+    S.bTransformOnly = bRuleTransformOnly;
+    S.CaptureMode = Recorder->CaptureMode;
 
     // Used for consistent timing + stop logic
     S.SpawnSampleIndex = SessionSampleCounter;
-
-    // Start recording (skeletal-only)
-    Recorder->StartRecording_ExternalWithPreRoll(SessionSampleCounter);
+    S.EndSampleIndex = INDEX_NONE;
 
     // Store name now so we still have it even if actor gets destroyed
     S.OutputNameOverride = MakeDefaultAssetName(Actor);
@@ -1788,10 +1978,23 @@ bool UMocapCaptureEditorSessionManager::TryAutoCaptureActor(AActor* Actor, const
         }
     }
 
+    // Start recording only the frames for this actor's actual lifetime.
+    // The grouped exporter uses StartSampleIndex to hide the actor before spawn.
+    if (bRuleTransformOnly)
+    {
+        Recorder->StartRecording_ExternalTransformOnly(SessionSampleCounter);
+    }
+    else
+    {
+        Recorder->StartRecording_ExternalWithPreRoll(0);
+    }
+
     UE_LOG(LogMocapRecorderEditor, Warning,
-        TEXT("Session: AutoCapture START %s SkeletalOnly SampleStart=%d"),
+        TEXT("Session: AutoCapture START %s TransformOnly=%d SampleStart=%d SourceMesh=%s"),
         *GetNameSafe(Actor),
-        SessionSampleCounter);
+        bRuleTransformOnly ? 1 : 0,
+        SessionSampleCounter,
+        S.SourceMeshAssetPath.IsEmpty() ? TEXT("<none>") : *S.SourceMeshAssetPath);
 
     ActiveInstances.Add(S);
 
@@ -1835,7 +2038,31 @@ void UMocapCaptureEditorSessionManager::RequestStopForActor(AActor* Actor)
 
 void UMocapCaptureEditorSessionManager::HandleAutoCapturedActorDestroyed(AActor* DestroyedActor)
 {
-    RequestStopForActor(DestroyedActor);
+    if (!DestroyedActor)
+    {
+        return;
+    }
+
+    for (int32 i = ActiveInstances.Num() - 1; i >= 0; --i)
+    {
+        FMocapInstanceState& S = ActiveInstances[i];
+        if (S.Actor.Get() != DestroyedActor)
+        {
+            continue;
+        }
+
+        UMocapRecorderComponent* Recorder = S.Recorder.Get();
+        if (IsValid(Recorder) && Recorder->bIsRecording)
+        {
+            S.EndSampleIndex = FMath::Max(S.SpawnSampleIndex, SessionSampleCounter);
+            Recorder->EndSampleIndex = S.EndSampleIndex;
+            Recorder->StopRecording_External(true);
+        }
+
+        FinalizeAutoInstanceOutput(S, Recorder);
+        ActiveInstances.RemoveAtSwap(i);
+        return;
+    }
 }
 
 void UMocapCaptureEditorSessionManager::HandleAutoCapturedActorHit(AActor* SelfActor, AActor* OtherActor, FVector NormalImpulse, const FHitResult& Hit)
@@ -1913,6 +2140,11 @@ void UMocapCaptureEditorSessionManager::FinalizeAutoInstanceOutput(const FMocapI
     if (!IsValid(Recorder))
         return;
 
+    const int32 FinalEndSampleIndex = S.EndSampleIndex != INDEX_NONE
+        ? S.EndSampleIndex
+        : FMath::Max(Recorder->StartSampleIndex, SessionSampleCounter);
+    Recorder->EndSampleIndex = FMath::Max(Recorder->StartSampleIndex, FinalEndSampleIndex);
+
     const bool bTransformOnly = Recorder->IsTransformOnly();
 
     const int32 NumFrames =
@@ -1927,7 +2159,7 @@ void UMocapCaptureEditorSessionManager::FinalizeAutoInstanceOutput(const FMocapI
         bTransformOnly ? 1 : 0,
         *GetNameSafe(Recorder->GetRecordedSkeleton()));
 
-    if (NumFrames <= 0 || !IsValid(Recorder->GetOwner()))
+    if (NumFrames <= 0)
     {
         return;
     }
@@ -1940,6 +2172,8 @@ void UMocapCaptureEditorSessionManager::FinalizeAutoInstanceOutput(const FMocapI
         {
             FMocapBakeJob Job;
             Job.RecorderSnapshot = TStrongObjectPtr<UMocapRecorderComponent>(Snapshot);
+            Job.StartSampleIndex = Snapshot->StartSampleIndex;
+            Job.EndSampleIndex = Snapshot->EndSampleIndex;
             Job.bPreserveSourceSampleRate = bPreserveSourceSampleRate;
 
             Job.AssetName =
@@ -1947,10 +2181,10 @@ void UMocapCaptureEditorSessionManager::FinalizeAutoInstanceOutput(const FMocapI
                     MakeBatchQualifiedBakeName(
                         !S.OutputNameOverride.IsEmpty()
                         ? S.OutputNameOverride
-                        : MakeDefaultAssetName(Recorder->GetOwner())));
+                            : (IsValid(Recorder->GetOwner()) ? MakeDefaultAssetName(Recorder->GetOwner()) : TEXT("Baked_Actor"))));
             Job.ExportGroupName = MakeBakeGroupName(S, Recorder->GetOwner());
             Job.RelativeExportFolder = S.ExportFolder;
-            Job.ExportItemName = Recorder->GetOwner() ? Recorder->GetOwner()->GetName() : Job.AssetName;
+            Job.ExportItemName = IsValid(Recorder->GetOwner()) ? Recorder->GetOwner()->GetName() : Job.AssetName;
 
             PendingBakeJobs.Add(MoveTemp(Job));
 
@@ -1958,7 +2192,8 @@ void UMocapCaptureEditorSessionManager::FinalizeAutoInstanceOutput(const FMocapI
                 Snapshot,
                 MakeBakeGroupName(S, Recorder->GetOwner()),
                 S.ExportFolder,
-                Recorder->GetOwner() ? Recorder->GetOwner()->GetName() : TEXT("Actor"));
+                IsValid(Recorder->GetOwner()) ? Recorder->GetOwner()->GetName() : Job.AssetName,
+                S.SourceMeshAssetPath);
 
             UE_LOG(LogMocapRecorderEditor, Warning,
                 TEXT("FinalizeAutoInstanceOutput: Enqueued BAKE job. PendingBakeJobs=%d"),
@@ -1987,6 +2222,12 @@ void UMocapCaptureEditorSessionManager::TickAutoStop(float DeltaTime)
         // If actor is gone, finalize what we have and drop
         if (!IsValid(Actor))
         {
+            if (R->bIsRecording)
+            {
+                S.EndSampleIndex = FMath::Max(S.SpawnSampleIndex, SessionSampleCounter);
+                R->EndSampleIndex = S.EndSampleIndex;
+                R->StopRecording_External(true);
+            }
             FinalizeAutoInstanceOutput(S, R);
             ActiveInstances.RemoveAtSwap(i);
             continue;
@@ -2003,6 +2244,8 @@ void UMocapCaptureEditorSessionManager::TickAutoStop(float DeltaTime)
         const bool bStopNow = S.bStopRequested;
         if (bStopNow)
         {
+            S.EndSampleIndex = FMath::Max(S.SpawnSampleIndex, SessionSampleCounter);
+            R->EndSampleIndex = S.EndSampleIndex;
             R->StopRecording_External();
 
             // enqueue bake job (including transform-only)
@@ -2085,6 +2328,35 @@ void UMocapCaptureEditorSessionManager::BeginBakeQueue()
     bIsBaking = true;
     AddToRoot();
 
+    {
+        FString AuditJson = TEXT("{\n  \"phase\": \"BeginBakeQueue\",\n  \"jobs\": [\n");
+        for (int32 JobIndex = 0; JobIndex < PendingBakeJobs.Num(); ++JobIndex)
+        {
+            const FMocapBakeJob& Job = PendingBakeJobs[JobIndex];
+            const UMocapRecorderComponent* Snapshot = Job.RecorderSnapshot.Get();
+            AuditJson += FString::Printf(
+                TEXT("    {\"asset\":\"%s\",\"jobStart\":%d,\"jobEnd\":%d,\"jobTotal\":%d,\"snapshotStart\":%d,\"snapshotEnd\":%d,\"snapshotTotal\":%d}%s\n"),
+                *JsonEscape(Job.AssetName),
+                Job.StartSampleIndex,
+                Job.EndSampleIndex,
+                Job.SessionTotalSampleCount,
+                Snapshot ? Snapshot->StartSampleIndex : INDEX_NONE,
+                Snapshot ? Snapshot->EndSampleIndex : INDEX_NONE,
+                Snapshot ? Snapshot->SessionTotalSampleCount : 0,
+                JobIndex + 1 < PendingBakeJobs.Num() ? TEXT(",") : TEXT(""));
+        }
+        AuditJson += TEXT("  ]\n}\n");
+
+        const FString AuditRoot = GroupedExportRootDirectory.IsEmpty()
+            ? FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MocapExports"))
+            : GroupedExportRootDirectory;
+        const FString AuditDir = FPaths::Combine(AuditRoot, SanitizeBakeNameFragment(ActiveBatchExportName.IsEmpty() ? TEXT("Latest") : ActiveBatchExportName));
+        FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*AuditDir);
+        const FString AuditPath = FPaths::Combine(AuditDir, TEXT("BakeTimingAudit_BeginBakeQueue.json"));
+        FFileHelper::SaveStringToFile(AuditJson, *AuditPath);
+        UE_LOG(LogMocapRecorderEditor, Warning, TEXT("BakeQueue: Wrote timing audit -> %s"), *AuditPath);
+    }
+
 
     if (NextBakeJobIndex < 0 || NextBakeJobIndex >= PendingBakeJobs.Num())
     {
@@ -2155,6 +2427,14 @@ bool UMocapCaptureEditorSessionManager::TickBakeQueue(float DeltaTime)
         return true; // keep ticking to continue queue
     }
 
+    // Bake-job timing is the durable source of truth. Restore it immediately before baking so
+    // snapshot resets, PIE teardown, or later export preparation cannot flatten the asset.
+    SnapshotRecorder->StartSampleIndex = FMath::Max(0, Job.StartSampleIndex);
+    SnapshotRecorder->EndSampleIndex = Job.EndSampleIndex != INDEX_NONE
+        ? FMath::Max(SnapshotRecorder->StartSampleIndex, Job.EndSampleIndex)
+        : INDEX_NONE;
+    SnapshotRecorder->SessionTotalSampleCount = FMath::Max(Job.SessionTotalSampleCount, SnapshotRecorder->SessionTotalSampleCount);
+
     const bool bTO = SnapshotRecorder->IsTransformOnly();
     const int32 FrameCount =
         bTO
@@ -2183,15 +2463,30 @@ bool UMocapCaptureEditorSessionManager::TickBakeQueue(float DeltaTime)
     UE_LOG(
         LogMocapRecorderEditor,
         Warning,
-        TEXT("BakeQueue: BakeCall idx=%d/%d path=%s name=%s owner=%s frames=%d skel=%s"),
+        TEXT("BakeQueue: BakeCall idx=%d/%d path=%s name=%s owner=%s frames=%d skel=%s JobTiming(Start=%d End=%d Total=%d) SnapshotTiming(Start=%d End=%d Total=%d)"),
         NextBakeJobIndex + 1,
         PendingBakeJobs.Num(),
         *AssetPath,
         *Job.AssetName,
         *GetNameSafe(SnapshotRecorder->GetOwner()),
         FrameCount,
-        *GetNameSafe(SnapshotRecorder->GetRecordedSkeleton())
+        *GetNameSafe(SnapshotRecorder->GetRecordedSkeleton()),
+        Job.StartSampleIndex,
+        Job.EndSampleIndex,
+        Job.SessionTotalSampleCount,
+        SnapshotRecorder->StartSampleIndex,
+        SnapshotRecorder->EndSampleIndex,
+        SnapshotRecorder->SessionTotalSampleCount
     );
+
+    if (SnapshotRecorder->SessionTotalSampleCount <= 0)
+    {
+        UE_LOG(LogMocapRecorderEditor, Error,
+            TEXT("BakeQueue: TIMING INVALID for %s: no shared session total. Baking local clip would flatten timing; job skipped."),
+            *Job.AssetName);
+        ++NextBakeJobIndex;
+        return true;
+    }
 
     FMocapRecorderEditorModule& Mod =
         FModuleManager::LoadModuleChecked<FMocapRecorderEditorModule>("MocapRecorderEditor");
@@ -2377,7 +2672,9 @@ bool UMocapCaptureEditorSessionManager::TickExportQueue(float DeltaTime)
 
         WriteHierarchyWarningJson(BatchDir, LastHierarchyWarnings);
         EndExportQueue();
-        ShowBakeNotification(TEXT("Grouped mocap FBX export finished."), SNotificationItem::CS_Success);
+        ShowBakeNotification(
+            FString::Printf(TEXT("Grouped mocap %s export finished."), GroupedExportFormat == EMocapGroupedExportFormat::GLTF ? TEXT("GLTF") : TEXT("FBX")),
+            SNotificationItem::CS_Success);
         return false;
     }
 
@@ -2405,7 +2702,8 @@ bool UMocapCaptureEditorSessionManager::TickExportQueue(float DeltaTime)
     if (ExportJobVisualPhase == 1)
     {
         SetExportQueuePhaseText(FString::Printf(
-            TEXT("Ready to write FBX for '%s'. The editor may pause while Unreal's exporter finishes."),
+            TEXT("Ready to write %s for '%s'. The editor may pause while Unreal's exporter finishes."),
+            GroupedExportFormat == EMocapGroupedExportFormat::GLTF ? TEXT("GLTF") : TEXT("FBX"),
             *ExportJob.AssetName));
         ExportJobVisualPhase = 2;
         return true;
@@ -2416,7 +2714,10 @@ bool UMocapCaptureEditorSessionManager::TickExportQueue(float DeltaTime)
         PendingExportJobs.Num(),
         *ExportJob.AssetName);
 
-    SetExportQueuePhaseText(FString::Printf(TEXT("Writing FBX for '%s'..."), *ExportJob.AssetName), true);
+    SetExportQueuePhaseText(FString::Printf(
+        TEXT("Writing %s for '%s'..."),
+        GroupedExportFormat == EMocapGroupedExportFormat::GLTF ? TEXT("GLTF") : TEXT("FBX"),
+        *ExportJob.AssetName), true);
     const bool bOk = bNormalSingleExport
         ? ExportNormalSingleFbx(ExportJob)
         : ExportGroupedSceneFbx(ExportJob);
@@ -2653,9 +2954,12 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
     }
 
     TArray<AActor*> TempActors;
-    TArray<USkeletalMeshComponent*> TempComponents;
+    TArray<USceneComponent*> TempBoundComponents;
+    TArray<USkeletalMeshComponent*> TempSkeletalComponents;
     TArray<UAnimSequence*> TempAnimations;
     TArray<int32> TempAnimationDurations;
+    TArray<int32> TempAnimationClipDurations;
+    TArray<int32> TempAnimationStartFrames;
     TArray<TArray<FTransform>> TempObjectTransforms;
     TArray<bool> TempTransformOnlyFlags;
     TArray<bool> TempNeedsSkeletalAnimationTrackFlags;
@@ -2666,10 +2970,11 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
     };
 
     AddTraceStep(FString::Printf(
-        TEXT("Start grouped export: Asset=%s Folder=%s SceneItems=%d"),
+        TEXT("Start grouped export: Asset=%s Folder=%s SceneItems=%d Format=%s"),
         *Job.AssetName,
         *Job.RelativeExportFolder,
-        Job.SceneItems.Num()));
+        Job.SceneItems.Num(),
+        GroupedExportFormat == EMocapGroupedExportFormat::GLTF ? TEXT("GLTF") : TEXT("FBX")));
 
     int32 GroupedPlaybackFrames = 1;
     int32 TimingScanIndex = 0;
@@ -2691,15 +2996,18 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
 
         const int32 SourceFPS = FMath::Max(1, FMath::RoundToInt(Snapshot->GetRecordedSampleRate()));
         const int32 BakeFPS = Job.bPreserveSourceSampleRate ? SourceFPS : FMath::Clamp(ExportFrameRateFps, 1, 240);
-        const int32 SourceFrameCount = Snapshot->GetRecordedFrames().Num();
+        const int32 SourceFrameCount = GetRecordedTimelineFrameCount(Snapshot);
         const int32 RawStartSampleIndex = FMath::Max(0, Snapshot->StartSampleIndex);
         const int32 StartFrameOffset = FMath::Max(0, FMath::RoundToInt((static_cast<double>(RawStartSampleIndex) / static_cast<double>(SourceFPS)) * static_cast<double>(BakeFPS)));
-        const bool bFramesContainRecorderPreroll = !Snapshot->IsTransformOnly() && RawStartSampleIndex > 0 && SourceFrameCount > RawStartSampleIndex;
-        const int32 EffectiveLeadingHoldFrames = (RawStartSampleIndex > 0 && !bFramesContainRecorderPreroll) ? StartFrameOffset : 0;
         const double SourceDuration = SourceFrameCount > 1
             ? static_cast<double>(SourceFrameCount - 1) / static_cast<double>(SourceFPS)
             : 0.0;
-        const int32 DurationFrames = EffectiveLeadingHoldFrames + FMath::Max(1, FMath::CeilToInt(SourceDuration * static_cast<double>(BakeFPS)) + 1);
+        const int32 RecordedDurationFrames = FMath::Max(1, FMath::CeilToInt(SourceDuration * static_cast<double>(BakeFPS)) + 1);
+        const int32 RawEndSampleIndex = Snapshot->EndSampleIndex != INDEX_NONE
+            ? FMath::Max(RawStartSampleIndex, Snapshot->EndSampleIndex)
+            : RawStartSampleIndex + FMath::Max(0, SourceFrameCount - 1);
+        const int32 EndFrameOffset = FMath::Max(StartFrameOffset, FMath::RoundToInt((static_cast<double>(RawEndSampleIndex) / static_cast<double>(SourceFPS)) * static_cast<double>(BakeFPS)));
+        const int32 DurationFrames = FMath::Max(StartFrameOffset + RecordedDurationFrames, EndFrameOffset + 2);
         GroupedPlaybackFrames = FMath::Max(GroupedPlaybackFrames, DurationFrames);
     }
 
@@ -2732,21 +3040,6 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
             continue;
         }
 
-        USkeletalMesh* RecordedMesh = Snapshot->GetRecordedMeshAsset();
-        if (!IsValid(RecordedMesh))
-        {
-            AddTraceStep(FString::Printf(TEXT("Skip item %s: invalid recorded mesh"), *UniqueItemName));
-            CurrentExportPreparedObjectCount = FMath::Min(CurrentExportObjectCount, CurrentExportPreparedObjectCount + 1);
-            SetExportQueuePhaseText(FString::Printf(
-                TEXT("Skipped object %d/%d in '%s' because the recorded mesh is invalid: %s"),
-                CurrentExportPreparedObjectCount,
-                CurrentExportObjectCount,
-                *Job.AssetName,
-                *UniqueItemName),
-                true);
-            continue;
-        }
-
         SetExportQueuePhaseText(FString::Printf(
             TEXT("Preparing object %d/%d in '%s': %s"),
             FMath::Min(CurrentExportObjectCount, CurrentExportPreparedObjectCount + 1),
@@ -2756,36 +3049,105 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
             true);
 
         const bool bTransformOnlySnapshot = Snapshot->IsTransformOnly();
+        const FString SourceMeshAssetPath = !Item.SourceMeshAssetPath.IsEmpty()
+            ? Item.SourceMeshAssetPath
+            : Snapshot->GetRecordedSourceMeshAssetPath();
+        USkeletalMesh* RecordedMesh = Snapshot->GetRecordedMeshAsset();
+        UStaticMesh* RecordedStaticMesh = nullptr;
+        TArray<UStaticMesh*> VisualStaticMeshes;
+        TArray<FTransform> VisualStaticMeshRelativeTransforms;
+        TArray<FName> VisualStaticMeshComponentNames;
+        if (bTransformOnlySnapshot && !SourceMeshAssetPath.IsEmpty())
+        {
+            UObject* SourceMeshAsset = LoadObject<UObject>(nullptr, *SourceMeshAssetPath);
+            RecordedStaticMesh = Cast<UStaticMesh>(SourceMeshAsset);
+            if (!IsValid(RecordedStaticMesh))
+            {
+                RecordedMesh = Cast<USkeletalMesh>(SourceMeshAsset);
+            }
+        }
+
+        if (bTransformOnlySnapshot)
+        {
+            const TArray<FMocapRecordedVisualMeshPart>& VisualMeshParts = Snapshot->GetRecordedVisualMeshParts();
+            VisualStaticMeshes.Reserve(VisualMeshParts.Num());
+            VisualStaticMeshRelativeTransforms.Reserve(VisualMeshParts.Num());
+            VisualStaticMeshComponentNames.Reserve(VisualMeshParts.Num());
+            for (const FMocapRecordedVisualMeshPart& Part : VisualMeshParts)
+            {
+                if (Part.MeshAssetPath.IsEmpty())
+                {
+                    continue;
+                }
+
+                if (UStaticMesh* PartStaticMesh = LoadObject<UStaticMesh>(nullptr, *Part.MeshAssetPath))
+                {
+                    VisualStaticMeshes.Add(PartStaticMesh);
+                    VisualStaticMeshRelativeTransforms.Add(Part.RelativeTransform);
+                    VisualStaticMeshComponentNames.Add(Part.ComponentName);
+                }
+            }
+        }
+
+        if (!IsValid(RecordedMesh) && !IsValid(RecordedStaticMesh) && VisualStaticMeshes.Num() == 0)
+        {
+            AddTraceStep(FString::Printf(
+                TEXT("Skip item %s: invalid recorded/source mesh SourceMeshAssetPath=%s"),
+                *UniqueItemName,
+                SourceMeshAssetPath.IsEmpty() ? TEXT("<none>") : *SourceMeshAssetPath));
+            CurrentExportPreparedObjectCount = FMath::Min(CurrentExportObjectCount, CurrentExportPreparedObjectCount + 1);
+            SetExportQueuePhaseText(FString::Printf(
+                TEXT("Skipped object %d/%d in '%s' because no source mesh could be resolved: %s"),
+                CurrentExportPreparedObjectCount,
+                CurrentExportObjectCount,
+                *Job.AssetName,
+                *UniqueItemName),
+                true);
+            continue;
+        }
+
         const bool bNeedsSkeletalAnimationTrack = !bTransformOnlySnapshot && HasMeaningfulNonRootBoneMotion(Snapshot);
         const int32 SnapshotFrameCount = Snapshot->GetRecordedFrames().Num();
         const int32 SnapshotTransformFrameCount = Snapshot->GetRecordedTransformFrames().Num();
         const int32 RecordedBoneCount = Snapshot->GetRecordedBoneNames().Num();
         AddTraceStep(FString::Printf(
-            TEXT("Item %s snapshot: TransformOnly=%d NeedsSkeletalAnimationTrack=%d RecordedFrames=%d TransformFrames=%d RecordedBones=%d Mesh=%s Skeleton=%s SampleRate=%.3f"),
+            TEXT("Item %s snapshot: TransformOnly=%d DestroyedOnStop=%d NeedsSkeletalAnimationTrack=%d RecordedFrames=%d TransformFrames=%d RecordedBones=%d SkeletalMesh=%s StaticMesh=%s VisualStaticParts=%d SourceMesh=%s Skeleton=%s SampleRate=%.3f"),
             *UniqueItemName,
             bTransformOnlySnapshot ? 1 : 0,
+            Snapshot->bActorWasDestroyedOnStop ? 1 : 0,
             bNeedsSkeletalAnimationTrack ? 1 : 0,
             SnapshotFrameCount,
             SnapshotTransformFrameCount,
             RecordedBoneCount,
             *GetNameSafe(RecordedMesh),
+            *GetNameSafe(RecordedStaticMesh),
+            VisualStaticMeshes.Num(),
+            SourceMeshAssetPath.IsEmpty() ? TEXT("<none>") : *SourceMeshAssetPath,
             *GetNameSafe(Snapshot->GetRecordedSkeleton()),
             Snapshot->GetRecordedSampleRate()));
 
         const int32 SourceFPS = FMath::Max(1, FMath::RoundToInt(Snapshot->GetRecordedSampleRate()));
         const int32 BakeFPS = Job.bPreserveSourceSampleRate ? SourceFPS : FMath::Clamp(ExportFrameRateFps, 1, 240);
-        const int32 SourceFrameCount = Snapshot->GetRecordedFrames().Num();
+        const int32 SourceFrameCount = GetRecordedTimelineFrameCount(Snapshot);
         const int32 RawStartSampleIndex = FMath::Max(0, Snapshot->StartSampleIndex);
         const int32 StartFrameOffset = FMath::Max(0, FMath::RoundToInt((static_cast<double>(RawStartSampleIndex) / static_cast<double>(SourceFPS)) * static_cast<double>(BakeFPS)));
-        const bool bFramesContainRecorderPreroll = !bTransformOnlySnapshot && RawStartSampleIndex > 0 && SourceFrameCount > RawStartSampleIndex;
+        const int32 RawEndSampleIndex = Snapshot->EndSampleIndex != INDEX_NONE
+            ? FMath::Max(RawStartSampleIndex, Snapshot->EndSampleIndex)
+            : RawStartSampleIndex + FMath::Max(0, SourceFrameCount - 1);
+        const int32 EndFrameOffset = FMath::Max(StartFrameOffset, FMath::RoundToInt((static_cast<double>(RawEndSampleIndex) / static_cast<double>(SourceFPS)) * static_cast<double>(BakeFPS)));
         const double SourceDuration = SourceFrameCount > 1
             ? static_cast<double>(SourceFrameCount - 1) / static_cast<double>(SourceFPS)
             : 0.0;
         const int32 RecordedDurationFrames = FMath::Max(1, FMath::CeilToInt(SourceDuration * static_cast<double>(BakeFPS)) + 1);
         const int32 DurationFrames = GroupedPlaybackFrames;
-        const int32 ExplicitLeadingHoldFrames = (RawStartSampleIndex > 0 && !bFramesContainRecorderPreroll) ? StartFrameOffset : 0;
-        const int32 EndAlignedLeadingHoldFrames = FMath::Max(0, DurationFrames - RecordedDurationFrames);
-        const int32 EffectiveLeadingHoldFrames = FMath::Max(ExplicitLeadingHoldFrames, EndAlignedLeadingHoldFrames);
+        int32 FirstVisibleSourceFrame = 0;
+        int32 LastVisibleSourceFrame = FMath::Max(0, SourceFrameCount - 1);
+        FindRecordedVisibleSourceRange(Snapshot, SourceFrameCount, FirstVisibleSourceFrame, LastVisibleSourceFrame);
+        const int32 FirstVisibleRecordedFrameOffset = FMath::Max(0, FMath::RoundToInt((static_cast<double>(FirstVisibleSourceFrame) / static_cast<double>(SourceFPS)) * static_cast<double>(BakeFPS)));
+        const int32 LastVisibleRecordedFrameOffset = FMath::Max(0, FMath::RoundToInt((static_cast<double>(LastVisibleSourceFrame) / static_cast<double>(SourceFPS)) * static_cast<double>(BakeFPS)));
+        const int32 EffectiveLeadingHoldFrames = FMath::Clamp(StartFrameOffset + FirstVisibleRecordedFrameOffset, 0, FMath::Max(0, DurationFrames - 1));
+        const int32 DestroyHideFrame = FMath::Clamp(FMath::Max(EndFrameOffset + 1, StartFrameOffset + LastVisibleRecordedFrameOffset + 1), 0, DurationFrames);
+        const int32 VisibleEndFrame = DestroyHideFrame;
         const double SourceDt = 1.0 / static_cast<double>(SourceFPS);
         const double BakeDt = 1.0 / static_cast<double>(BakeFPS);
 
@@ -2798,8 +3160,8 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
                 ExportFrameRateFps,
                 Job.bPreserveSourceSampleRate,
                 true,
-                DurationFrames,
-                EffectiveLeadingHoldFrames);
+                RecordedDurationFrames,
+                0);
 
         if (bNeedsSkeletalAnimationTrack && !IsValid(TempAnim))
         {
@@ -2816,31 +3178,36 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
         }
 
         AddTraceStep(FString::Printf(
-            TEXT("Item %s timing: SourceFPS=%d BakeFPS=%d StartSampleIndex=%d StartFrameOffset=%d FramesContainRecorderPreroll=%d ExplicitLeadingHoldFrames=%d EndAlignedLeadingHoldFrames=%d EffectiveLeadingHoldFrames=%d SourceFrames=%d RecordedDurationFrames=%d ExportDurationFrames=%d SourceDuration=%.6f PaddedLeadingFrames=%d PaddedTrailingFrames=%d"),
+            TEXT("Item %s timing: SourceFPS=%d BakeFPS=%d StartSampleIndex=%d EndSampleIndex=%d StartFrameOffset=%d EndFrameOffset=%d EffectiveLeadingHoldFrames=%d SourceFrames=%d RecordedDurationFrames=%d ExportDurationFrames=%d SourceDuration=%.6f VisibleEndFrame=%d DestroyHideFrame=%d PaddedLeadingFrames=%d HiddenTrailingFrames=%d VisibleSourceRange=[%d,%d]"),
             *UniqueItemName,
             SourceFPS,
             BakeFPS,
             RawStartSampleIndex,
+            RawEndSampleIndex,
             StartFrameOffset,
-            bFramesContainRecorderPreroll ? 1 : 0,
-            ExplicitLeadingHoldFrames,
-            EndAlignedLeadingHoldFrames,
+            EndFrameOffset,
             EffectiveLeadingHoldFrames,
             SourceFrameCount,
             RecordedDurationFrames,
             DurationFrames,
             SourceDuration,
+            VisibleEndFrame,
+            DestroyHideFrame,
             EffectiveLeadingHoldFrames,
-            FMath::Max(0, DurationFrames - EffectiveLeadingHoldFrames - RecordedDurationFrames)));
+            FMath::Max(0, DurationFrames - VisibleEndFrame),
+            FirstVisibleSourceFrame,
+            LastVisibleSourceFrame));
 
         TArray<FTransform> ObjectTransforms;
         TArray<FTransform> RootBoneTransforms;
         ObjectTransforms.Reserve(DurationFrames);
         RootBoneTransforms.Reserve(DurationFrames);
         const FVector PreSpawnHiddenScale(0.001, 0.001, 0.001);
+        const FTransform SpawnTransform = GetRecordedObjectTransformAtFrame(Snapshot, FirstVisibleSourceFrame);
+        const FTransform DestroyTransform = GetRecordedObjectTransformAtFrame(Snapshot, LastVisibleSourceFrame);
         for (int32 FrameIndex = 0; FrameIndex < DurationFrames; ++FrameIndex)
         {
-            const int32 SourceTimelineFrame = FMath::Max(0, FrameIndex - EffectiveLeadingHoldFrames);
+            const int32 SourceTimelineFrame = FMath::Max(0, FrameIndex - StartFrameOffset);
             const int32 SourceFrameIndex = FMath::Clamp(
                 FMath::RoundToInt((static_cast<double>(SourceTimelineFrame) * BakeDt) / SourceDt),
                 0,
@@ -2848,6 +3215,12 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
             FTransform ObjectTransform = GetRecordedObjectTransformAtFrame(Snapshot, SourceFrameIndex);
             if (FrameIndex < EffectiveLeadingHoldFrames)
             {
+                ObjectTransform = SpawnTransform;
+                ObjectTransform.SetScale3D(PreSpawnHiddenScale);
+            }
+            else if (FrameIndex >= DestroyHideFrame)
+            {
+                ObjectTransform = DestroyTransform;
                 ObjectTransform.SetScale3D(PreSpawnHiddenScale);
             }
             ObjectTransforms.Add(ObjectTransform);
@@ -2938,34 +3311,95 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
         TempActor->AddInstanceComponent(SceneRootComponent);
         SceneRootComponent->RegisterComponent();
 
-        USkeletalMeshComponent* SkeletalMeshComponent = NewObject<USkeletalMeshComponent>(
-            TempActor,
-            MakeUniqueObjectName(TempActor, USkeletalMeshComponent::StaticClass(), FName(*FString::Printf(TEXT("%s_SkeletalMesh"), *UniqueItemName))));
-        SkeletalMeshComponent->SetMobility(EComponentMobility::Movable);
-        SkeletalMeshComponent->SetSkeletalMeshAsset(RecordedMesh);
-        if (IsValid(TempAnim))
+        USceneComponent* BoundComponent = nullptr;
+        USkeletalMeshComponent* SkeletalMeshComponent = nullptr;
+        if (VisualStaticMeshes.Num() > 0)
         {
-            SkeletalMeshComponent->SetAnimationMode(EAnimationMode::AnimationSingleNode);
-            SkeletalMeshComponent->SetAnimation(TempAnim);
-            SkeletalMeshComponent->PlayAnimation(TempAnim, false);
-        }
-        SkeletalMeshComponent->bEnableUpdateRateOptimizations = false;
-        SkeletalMeshComponent->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
-        SkeletalMeshComponent->SetForcedLOD(1);
-
-        const TArray<TObjectPtr<UMaterialInterface>>& MaterialOverrides = Snapshot->GetRecordedMaterialOverrides();
-        for (int32 MaterialIndex = 0; MaterialIndex < MaterialOverrides.Num(); ++MaterialIndex)
-        {
-            if (MaterialOverrides[MaterialIndex])
+            for (int32 PartIndex = 0; PartIndex < VisualStaticMeshes.Num(); ++PartIndex)
             {
-                SkeletalMeshComponent->SetMaterial(MaterialIndex, MaterialOverrides[MaterialIndex]);
+                UStaticMesh* PartStaticMesh = VisualStaticMeshes[PartIndex];
+                if (!IsValid(PartStaticMesh))
+                {
+                    continue;
+                }
+
+                const FName SourceComponentName = VisualStaticMeshComponentNames.IsValidIndex(PartIndex)
+                    ? VisualStaticMeshComponentNames[PartIndex]
+                    : NAME_None;
+                const FString ComponentNameFragment = SourceComponentName != NAME_None
+                    ? SanitizeBakeNameFragment(SourceComponentName.ToString())
+                    : FString::Printf(TEXT("Part_%03d"), PartIndex);
+                UStaticMeshComponent* StaticMeshComponent = NewObject<UStaticMeshComponent>(
+                    TempActor,
+                    MakeUniqueObjectName(TempActor, UStaticMeshComponent::StaticClass(), FName(*FString::Printf(TEXT("%s_%s_StaticMesh"), *UniqueItemName, *ComponentNameFragment))));
+                StaticMeshComponent->SetMobility(EComponentMobility::Movable);
+                StaticMeshComponent->SetStaticMesh(PartStaticMesh);
+                StaticMeshComponent->SetupAttachment(SceneRootComponent);
+                StaticMeshComponent->SetRelativeTransform(VisualStaticMeshRelativeTransforms.IsValidIndex(PartIndex)
+                    ? VisualStaticMeshRelativeTransforms[PartIndex]
+                    : FTransform::Identity);
+                TempActor->AddInstanceComponent(StaticMeshComponent);
+                StaticMeshComponent->RegisterComponent();
+
+                if (!BoundComponent)
+                {
+                    BoundComponent = StaticMeshComponent;
+                }
+
+                AddTraceStep(FString::Printf(
+                    TEXT("Item %s visual part %d registered: Component=%s Mesh=%s Relative=%s"),
+                    *UniqueItemName,
+                    PartIndex,
+                    SourceComponentName != NAME_None ? *SourceComponentName.ToString() : TEXT("<unnamed>"),
+                    *GetNameSafe(PartStaticMesh),
+                    *FormatTransformForTrace(StaticMeshComponent->GetRelativeTransform())));
             }
         }
+        else if (IsValid(RecordedStaticMesh))
+        {
+            UStaticMeshComponent* StaticMeshComponent = NewObject<UStaticMeshComponent>(
+                TempActor,
+                MakeUniqueObjectName(TempActor, UStaticMeshComponent::StaticClass(), FName(*FString::Printf(TEXT("%s_StaticMesh"), *UniqueItemName))));
+            StaticMeshComponent->SetMobility(EComponentMobility::Movable);
+            StaticMeshComponent->SetStaticMesh(RecordedStaticMesh);
+            StaticMeshComponent->SetupAttachment(SceneRootComponent);
+            StaticMeshComponent->SetRelativeTransform(FTransform::Identity);
+            TempActor->AddInstanceComponent(StaticMeshComponent);
+            StaticMeshComponent->RegisterComponent();
+            BoundComponent = StaticMeshComponent;
+        }
+        else
+        {
+            SkeletalMeshComponent = NewObject<USkeletalMeshComponent>(
+                TempActor,
+                MakeUniqueObjectName(TempActor, USkeletalMeshComponent::StaticClass(), FName(*FString::Printf(TEXT("%s_SkeletalMesh"), *UniqueItemName))));
+            SkeletalMeshComponent->SetMobility(EComponentMobility::Movable);
+            SkeletalMeshComponent->SetSkeletalMeshAsset(RecordedMesh);
+            if (IsValid(TempAnim))
+            {
+                SkeletalMeshComponent->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+                SkeletalMeshComponent->SetAnimation(TempAnim);
+                SkeletalMeshComponent->PlayAnimation(TempAnim, false);
+            }
+            SkeletalMeshComponent->bEnableUpdateRateOptimizations = false;
+            SkeletalMeshComponent->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+            SkeletalMeshComponent->SetForcedLOD(1);
 
-        SkeletalMeshComponent->SetupAttachment(SceneRootComponent);
-        SkeletalMeshComponent->SetRelativeTransform(FTransform::Identity);
-        TempActor->AddInstanceComponent(SkeletalMeshComponent);
-        SkeletalMeshComponent->RegisterComponent();
+            const TArray<TObjectPtr<UMaterialInterface>>& MaterialOverrides = Snapshot->GetRecordedMaterialOverrides();
+            for (int32 MaterialIndex = 0; MaterialIndex < MaterialOverrides.Num(); ++MaterialIndex)
+            {
+                if (MaterialOverrides[MaterialIndex])
+                {
+                    SkeletalMeshComponent->SetMaterial(MaterialIndex, MaterialOverrides[MaterialIndex]);
+                }
+            }
+
+            SkeletalMeshComponent->SetupAttachment(SceneRootComponent);
+            SkeletalMeshComponent->SetRelativeTransform(FTransform::Identity);
+            TempActor->AddInstanceComponent(SkeletalMeshComponent);
+            SkeletalMeshComponent->RegisterComponent();
+            BoundComponent = SkeletalMeshComponent;
+        }
         AddTraceStep(FString::Printf(
             TEXT("Item %s temp component registered: ExpectedFirstObjectTransform=%s ActorTransform=%s RootTransform=%s RootRelative=%s ComponentTransform=%s RelativeTransform=%s Anim=%s"),
             *UniqueItemName,
@@ -2973,14 +3407,17 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
             *FormatTransformForTrace(TempActor->GetActorTransform()),
             *FormatTransformForTrace(SceneRootComponent->GetComponentTransform()),
             *FormatTransformForTrace(SceneRootComponent->GetRelativeTransform()),
-            *FormatTransformForTrace(SkeletalMeshComponent->GetComponentTransform()),
-            *FormatTransformForTrace(SkeletalMeshComponent->GetRelativeTransform()),
+            *FormatTransformForTrace(IsValid(BoundComponent) ? BoundComponent->GetComponentTransform() : FTransform::Identity),
+            *FormatTransformForTrace(IsValid(BoundComponent) ? BoundComponent->GetRelativeTransform() : FTransform::Identity),
             *GetNameSafe(TempAnim)));
 
         TempActors.Add(TempActor);
-        TempComponents.Add(SkeletalMeshComponent);
+        TempBoundComponents.Add(BoundComponent);
+        TempSkeletalComponents.Add(SkeletalMeshComponent);
         TempAnimations.Add(TempAnim);
         TempAnimationDurations.Add(DurationFrames);
+        TempAnimationClipDurations.Add(RecordedDurationFrames);
+        TempAnimationStartFrames.Add(StartFrameOffset);
         TempObjectTransforms.Add(MoveTemp(ObjectTransforms));
         TempTransformOnlyFlags.Add(bTransformOnlySnapshot);
         TempNeedsSkeletalAnimationTrackFlags.Add(bNeedsSkeletalAnimationTrack);
@@ -3014,9 +3451,10 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
     const FString OutDir = FPaths::Combine(RootDir, BatchName, SanitizeRelativeExportFolder(Job.RelativeExportFolder));
     IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
     PF.CreateDirectoryTree(*OutDir);
-    const FString OutFile = FPaths::Combine(OutDir, Job.AssetName + TEXT(".fbx"));
+    const bool bExportGltf = GroupedExportFormat == EMocapGroupedExportFormat::GLTF;
+    const FString OutFile = FPaths::Combine(OutDir, Job.AssetName + (bExportGltf ? TEXT(".gltf") : TEXT(".fbx")));
     const FString TraceFile = FPaths::Combine(OutDir, Job.AssetName + TEXT("_GroupedExportTrace.json"));
-    AddTraceStep(FString::Printf(TEXT("Output paths: FBX=%s Trace=%s"), *OutFile, *TraceFile));
+    AddTraceStep(FString::Printf(TEXT("Output paths: %s=%s Trace=%s"), bExportGltf ? TEXT("GLTF") : TEXT("FBX"), *OutFile, *TraceFile));
 
     ULevelSequence* TempSequence = NewObject<ULevelSequence>(
         GetTransientPackage(),
@@ -3080,12 +3518,16 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
             true);
 
         AActor* TempActor = TempActors[ActorIndex];
-        USkeletalMeshComponent* TempComponent = TempComponents.IsValidIndex(ActorIndex) ? TempComponents[ActorIndex] : nullptr;
+        USceneComponent* TempComponent = TempBoundComponents.IsValidIndex(ActorIndex) ? TempBoundComponents[ActorIndex] : nullptr;
+        USkeletalMeshComponent* TempSkeletalComponent = TempSkeletalComponents.IsValidIndex(ActorIndex) ? TempSkeletalComponents[ActorIndex] : nullptr;
         UAnimSequence* TempAnim = TempAnimations.IsValidIndex(ActorIndex) ? TempAnimations[ActorIndex] : nullptr;
         const bool bTransformOnlyActor = TempTransformOnlyFlags.IsValidIndex(ActorIndex) ? TempTransformOnlyFlags[ActorIndex] : false;
         const bool bNeedsSkeletalAnimationTrack = TempNeedsSkeletalAnimationTrackFlags.IsValidIndex(ActorIndex) ? TempNeedsSkeletalAnimationTrackFlags[ActorIndex] : false;
         const int32 DurationFrames = TempAnimationDurations.IsValidIndex(ActorIndex) ? TempAnimationDurations[ActorIndex] : 1;
-        if (!IsValid(TempActor) || !IsValid(TempComponent) || (bNeedsSkeletalAnimationTrack && !IsValid(TempAnim)))
+        const int32 AnimationStartFrame = TempAnimationStartFrames.IsValidIndex(ActorIndex) ? FMath::Max(0, TempAnimationStartFrames[ActorIndex]) : 0;
+        const int32 AnimationClipFrames = TempAnimationClipDurations.IsValidIndex(ActorIndex) ? FMath::Max(1, TempAnimationClipDurations[ActorIndex]) : DurationFrames;
+        const int32 AnimationEndFrame = FMath::Min(DurationFrames, FMath::Max(AnimationStartFrame + 1, AnimationStartFrame + AnimationClipFrames));
+        if (!IsValid(TempActor) || !IsValid(TempComponent) || (bNeedsSkeletalAnimationTrack && (!IsValid(TempAnim) || !IsValid(TempSkeletalComponent))))
         {
             continue;
         }
@@ -3097,6 +3539,10 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
         {
             ComponentPossessable->SetParent(ActorBindingGuid, MovieScene);
         }
+
+        TempSequence->BindPossessableObject(ActorBindingGuid, *TempActor, ExportWorld);
+        TempSequence->BindPossessableObject(ComponentBindingGuid, *TempComponent, TempActor);
+
         AddTraceStep(FString::Printf(
             TEXT("ItemIndex=%d bindings created: Actor=%s ActorGuid=%s Component=%s ComponentGuid=%s ParentComponentToActor=1 TransformOnly=%d"),
             ActorIndex,
@@ -3151,10 +3597,10 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
         UMovieSceneSkeletalAnimationTrack* ActorAnimTrack = MovieScene->AddTrack<UMovieSceneSkeletalAnimationTrack>(ActorBindingGuid);
         if (IsValid(ActorAnimTrack))
         {
-            UMovieSceneSection* ActorAnimSectionBase = ActorAnimTrack->AddNewAnimation(FFrameNumber(0), TempAnim);
+            UMovieSceneSection* ActorAnimSectionBase = ActorAnimTrack->AddNewAnimation(FFrameNumber(AnimationStartFrame), TempAnim);
             if (UMovieSceneSkeletalAnimationSection* ActorAnimSection = Cast<UMovieSceneSkeletalAnimationSection>(ActorAnimSectionBase))
             {
-                ActorAnimSection->SetRange(TRange<FFrameNumber>(FFrameNumber(0), FFrameNumber(DurationFrames)));
+                ActorAnimSection->SetRange(TRange<FFrameNumber>(FFrameNumber(AnimationStartFrame), FFrameNumber(AnimationEndFrame)));
                 ActorAnimSection->Params.Animation = TempAnim;
                 ActorAnimSection->Params.StartFrameOffset = FFrameNumber(0);
                 ActorAnimSection->Params.FirstLoopStartFrameOffset = FFrameNumber(0);
@@ -3164,11 +3610,12 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
                 ActorAnimSection->Params.bForceCustomMode = true;
                 MaxPlaybackFrames = FMath::Max(MaxPlaybackFrames, DurationFrames);
                 AddTraceStep(FString::Printf(
-                    TEXT("ItemIndex=%d track created: Actor skeletal animation Track=%s Anim=%s SectionRange=[0,%d] ForceCustomMode=1 ExporterCompatibility=1"),
+                    TEXT("ItemIndex=%d track created: Actor skeletal animation Track=%s Anim=%s SectionRange=[%d,%d] ForceCustomMode=1 ExporterCompatibility=1"),
                     ActorIndex,
                     *GetNameSafe(ActorAnimTrack),
                     *GetNameSafe(TempAnim),
-                    DurationFrames));
+                    AnimationStartFrame,
+                    AnimationEndFrame));
                 bActorSkeletalTrackCreated = true;
             }
             Tracks.Add(ActorAnimTrack);
@@ -3185,10 +3632,10 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
             continue;
         }
 
-        UMovieSceneSection* Section = AnimTrack->AddNewAnimation(FFrameNumber(0), TempAnim);
+        UMovieSceneSection* Section = AnimTrack->AddNewAnimation(FFrameNumber(AnimationStartFrame), TempAnim);
         if (UMovieSceneSkeletalAnimationSection* AnimSection = Cast<UMovieSceneSkeletalAnimationSection>(Section))
         {
-            AnimSection->SetRange(TRange<FFrameNumber>(FFrameNumber(0), FFrameNumber(DurationFrames)));
+            AnimSection->SetRange(TRange<FFrameNumber>(FFrameNumber(AnimationStartFrame), FFrameNumber(AnimationEndFrame)));
             AnimSection->Params.Animation = TempAnim;
             AnimSection->Params.StartFrameOffset = FFrameNumber(0);
             AnimSection->Params.FirstLoopStartFrameOffset = FFrameNumber(0);
@@ -3198,11 +3645,12 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
             AnimSection->Params.bForceCustomMode = true;
             MaxPlaybackFrames = FMath::Max(MaxPlaybackFrames, DurationFrames);
             AddTraceStep(FString::Printf(
-                TEXT("ItemIndex=%d track created: Component skeletal animation Track=%s Anim=%s SectionRange=[0,%d] ForceCustomMode=1"),
+                TEXT("ItemIndex=%d track created: Component skeletal animation Track=%s Anim=%s SectionRange=[%d,%d] ForceCustomMode=1"),
                 ActorIndex,
                 *GetNameSafe(AnimTrack),
                 *GetNameSafe(TempAnim),
-                DurationFrames));
+                AnimationStartFrame,
+                AnimationEndFrame));
         }
 
         Tracks.Add(AnimTrack);
@@ -3288,13 +3736,13 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
             for (int32 BindingIndex = 0; BindingIndex < ComponentBindings.Num(); ++BindingIndex)
             {
                 SetExportQueuePhaseText(FString::Printf(
-                    TEXT("Binding skeletal mesh components %d/%d for '%s'."),
+                    TEXT("Binding mesh components %d/%d for '%s'."),
                     BindingIndex + 1,
                     ComponentBindings.Num(),
                     *Job.AssetName),
                     true);
 
-                USkeletalMeshComponent* BoundComponent = TempComponents.IsValidIndex(BindingIndex) ? TempComponents[BindingIndex] : nullptr;
+                USceneComponent* BoundComponent = TempBoundComponents.IsValidIndex(BindingIndex) ? TempBoundComponents[BindingIndex] : nullptr;
                 if (IsValid(BoundComponent))
                 {
                     TArray<UObject*> BoundObjects;
@@ -3326,7 +3774,7 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
         }
     }
     int32 ResolvedComponentBindings = 0;
-    for (USkeletalMeshComponent* TempComponent : TempComponents)
+    for (USceneComponent* TempComponent : TempBoundComponents)
     {
         if (IsValid(TempComponent) && SequencePlayer->FindObjectId(*TempComponent, MovieSceneSequenceID::Root).IsValid())
         {
@@ -3338,46 +3786,54 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
         ResolvedActorBindings,
         TempActors.Num(),
         ResolvedComponentBindings,
-        TempComponents.Num()));
+        TempBoundComponents.Num()));
 
-    for (int32 ActorIndex = 0; ActorIndex < TempActors.Num(); ++ActorIndex)
+    if (!bExportGltf)
     {
-        SetExportQueuePhaseText(FString::Printf(
-            TEXT("Final pre-FBX transform reset %d/%d for '%s'."),
-            ActorIndex + 1,
-            TempActors.Num(),
-            *Job.AssetName),
-            true);
-
-        AActor* TempActor = TempActors[ActorIndex];
-        USkeletalMeshComponent* TempComponent = TempComponents.IsValidIndex(ActorIndex) ? TempComponents[ActorIndex] : nullptr;
-        const FTransform ExpectedFirstObjectTransform =
-            (TempObjectTransforms.IsValidIndex(ActorIndex) && TempObjectTransforms[ActorIndex].Num() > 0)
-            ? TempObjectTransforms[ActorIndex][0]
-            : FTransform::Identity;
-
-        if (IsValid(TempComponent))
+        for (int32 ActorIndex = 0; ActorIndex < TempActors.Num(); ++ActorIndex)
         {
-            TempComponent->SetRelativeTransform(FTransform::Identity);
-        }
+            SetExportQueuePhaseText(FString::Printf(
+                TEXT("Final pre-FBX transform reset %d/%d for '%s'."),
+                ActorIndex + 1,
+                TempActors.Num(),
+                *Job.AssetName),
+                true);
 
-        if (IsValid(TempActor))
-        {
-            TempActor->SetActorTransform(FTransform::Identity);
-        }
+            AActor* TempActor = TempActors[ActorIndex];
+            USceneComponent* TempComponent = TempBoundComponents.IsValidIndex(ActorIndex) ? TempBoundComponents[ActorIndex] : nullptr;
+            USkeletalMeshComponent* TempSkeletalComponent = TempSkeletalComponents.IsValidIndex(ActorIndex) ? TempSkeletalComponents[ActorIndex] : nullptr;
+            const FTransform ExpectedFirstObjectTransform =
+                (TempObjectTransforms.IsValidIndex(ActorIndex) && TempObjectTransforms[ActorIndex].Num() > 0)
+                ? TempObjectTransforms[ActorIndex][0]
+                : FTransform::Identity;
 
-        if (IsValid(TempComponent))
-        {
-            TempComponent->RefreshBoneTransforms();
-        }
+            if (IsValid(TempComponent))
+            {
+                TempComponent->SetRelativeTransform(FTransform::Identity);
+            }
 
-        AddTraceStep(FString::Printf(
-            TEXT("Pre-FBX identity reset: ItemIndex=%d ExpectedFirstObjectTransform=%s ActorTransform=%s ComponentTransform=%s RelativeTransform=%s"),
-            ActorIndex,
-            *FormatTransformForTrace(ExpectedFirstObjectTransform),
-            *FormatTransformForTrace(IsValid(TempActor) ? TempActor->GetActorTransform() : FTransform::Identity),
-            *FormatTransformForTrace(IsValid(TempComponent) ? TempComponent->GetComponentTransform() : FTransform::Identity),
-            *FormatTransformForTrace(IsValid(TempComponent) ? TempComponent->GetRelativeTransform() : FTransform::Identity)));
+            if (IsValid(TempActor))
+            {
+                TempActor->SetActorTransform(FTransform::Identity);
+            }
+
+            if (IsValid(TempSkeletalComponent))
+            {
+                TempSkeletalComponent->RefreshBoneTransforms();
+            }
+
+            AddTraceStep(FString::Printf(
+                TEXT("Pre-FBX identity reset: ItemIndex=%d ExpectedFirstObjectTransform=%s ActorTransform=%s ComponentTransform=%s RelativeTransform=%s"),
+                ActorIndex,
+                *FormatTransformForTrace(ExpectedFirstObjectTransform),
+                *FormatTransformForTrace(IsValid(TempActor) ? TempActor->GetActorTransform() : FTransform::Identity),
+                *FormatTransformForTrace(IsValid(TempComponent) ? TempComponent->GetComponentTransform() : FTransform::Identity),
+                *FormatTransformForTrace(IsValid(TempComponent) ? TempComponent->GetRelativeTransform() : FTransform::Identity)));
+        }
+    }
+    else
+    {
+        AddTraceStep(TEXT("Skipped pre-FBX identity reset for GLTF export so sequence bindings keep their authored transforms."));
     }
 
     UE_LOG(LogMocapRecorderEditor, Warning,
@@ -3449,29 +3905,86 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
         }
     }
 
-    SetExportQueuePhaseText(FString::Printf(
-        TEXT("Handed '%s' to Unreal FBX writer (%d objects, %d tracks). If the editor pauses now, it is inside MovieSceneToolHelpers::ExportFBX."),
-        *Job.AssetName,
-        TempActors.Num(),
-        Tracks.Num()),
-        true);
+    bool bOk = false;
+    if (bExportGltf)
+    {
+        SetExportQueuePhaseText(FString::Printf(
+            TEXT("Handed '%s' to Unreal GLTF writer (%d objects, %d tracks)."),
+            *Job.AssetName,
+            TempActors.Num(),
+            Tracks.Num()),
+            true);
 
-    const bool bOk = MovieSceneToolHelpers::ExportFBX(
-        ExportWorld,
-        ExportParams,
-        Bindings,
-        Tracks,
-        NodeNameAdapter,
-        Template,
-        OutFile);
+        UGLTFExportOptions* GltfOptions = NewObject<UGLTFExportOptions>(
+            GetTransientPackage(),
+            MakeUniqueObjectName(GetTransientPackage(), UGLTFExportOptions::StaticClass(), TEXT("MocapGroupedGltfExportOptions")),
+            RF_Transient);
+        if (IsValid(GltfOptions))
+        {
+            GltfOptions->ResetToDefault();
+            GltfOptions->bExportLevelSequences = true;
+            GltfOptions->bExportAnimationSequences = true;
+            GltfOptions->bExportVertexSkinWeights = true;
+            GltfOptions->bExportHiddenInGame = true;
+        }
+
+        TSet<AActor*> SelectedActors;
+        for (AActor* TempActor : TempActors)
+        {
+            if (IsValid(TempActor))
+            {
+                SelectedActors.Add(TempActor);
+            }
+        }
+        if (IsValid(TempSequenceActor))
+        {
+            SelectedActors.Add(TempSequenceActor);
+        }
+
+        FGLTFExportMessages GltfMessages;
+        bOk = UGLTFExporter::ExportToGLTF(ExportWorld, OutFile, GltfOptions, SelectedActors, GltfMessages);
+        AddTraceStep(FString::Printf(
+            TEXT("UGLTFExporter::ExportToGLTF returned: %d Suggestions=%d Warnings=%d Errors=%d"),
+            bOk ? 1 : 0,
+            GltfMessages.Suggestions.Num(),
+            GltfMessages.Warnings.Num(),
+            GltfMessages.Errors.Num()));
+        for (const FString& Warning : GltfMessages.Warnings)
+        {
+            AddTraceStep(FString::Printf(TEXT("GLTF warning: %s"), *Warning));
+        }
+        for (const FString& Error : GltfMessages.Errors)
+        {
+            AddTraceStep(FString::Printf(TEXT("GLTF error: %s"), *Error));
+        }
+    }
+    else
+    {
+        SetExportQueuePhaseText(FString::Printf(
+            TEXT("Handed '%s' to Unreal FBX writer (%d objects, %d tracks). If the editor pauses now, it is inside MovieSceneToolHelpers::ExportFBX."),
+            *Job.AssetName,
+            TempActors.Num(),
+            Tracks.Num()),
+            true);
+
+        bOk = MovieSceneToolHelpers::ExportFBX(
+            ExportWorld,
+            ExportParams,
+            Bindings,
+            Tracks,
+            NodeNameAdapter,
+            Template,
+            OutFile);
+        AddTraceStep(FString::Printf(TEXT("MovieSceneToolHelpers::ExportFBX returned: %d"), bOk ? 1 : 0));
+    }
     if (FbxExporter)
     {
         FbxExporter->SetExportOptionsOverride(nullptr);
     }
 
-    AddTraceStep(FString::Printf(TEXT("MovieSceneToolHelpers::ExportFBX returned: %d"), bOk ? 1 : 0));
     SetExportQueuePhaseText(FString::Printf(
-        TEXT("Unreal FBX writer returned for '%s': %s. Writing trace and cleaning up."),
+        TEXT("Unreal %s writer returned for '%s': %s. Writing trace and cleaning up."),
+        bExportGltf ? TEXT("GLTF") : TEXT("FBX"),
         *Job.AssetName,
         bOk ? TEXT("OK") : TEXT("FAILED")),
         true);
@@ -3480,7 +3993,8 @@ bool UMocapCaptureEditorSessionManager::ExportGroupedSceneFbx(const FMocapBakeJo
     TraceJson += TEXT("{\n");
     TraceJson += FString::Printf(TEXT("  \"asset\": \"%s\",\n"), *JsonEscape(Job.AssetName));
     TraceJson += FString::Printf(TEXT("  \"folder\": \"%s\",\n"), *JsonEscape(Job.RelativeExportFolder));
-    TraceJson += FString::Printf(TEXT("  \"fbx\": \"%s\",\n"), *JsonEscape(OutFile));
+    TraceJson += FString::Printf(TEXT("  \"format\": \"%s\",\n"), bExportGltf ? TEXT("GLTF") : TEXT("FBX"));
+    TraceJson += FString::Printf(TEXT("  \"output\": \"%s\",\n"), *JsonEscape(OutFile));
     TraceJson += TEXT("  \"steps\": [\n");
     for (int32 StepIndex = 0; StepIndex < TraceSteps.Num(); ++StepIndex)
     {

@@ -119,7 +119,7 @@ bool UMocapRecorderControlComponent::ResolveRecorderComponent()
     return IsValid(RecorderComponent);
 }
 
-bool UMocapRecorderControlComponent::StartManagedRecording()
+bool UMocapRecorderControlComponent::StartManagedRecording(bool bTransformOnly)
 {
     if (!ResolveRecorderComponent())
     {
@@ -142,7 +142,7 @@ bool UMocapRecorderControlComponent::StartManagedRecording()
         LastLocation = Owner->GetActorLocation();
     }
 
-    RecorderComponent->StartRecording();
+    RecorderComponent->StartRecording(bTransformOnly);
     LastRecordedFrameCount = RecorderComponent->GetRecordedFrameCount();
     LastStopReason = EMocapRecorderStopReason::Manual;
     EmitStatusMessage(TEXT("Managed recording started."), EMocapRecorderStopReason::Manual);
@@ -150,9 +150,11 @@ bool UMocapRecorderControlComponent::StartManagedRecording()
     return RecorderComponent->bIsRecording;
 }
 
-void UMocapRecorderControlComponent::StopManagedRecording()
+void UMocapRecorderControlComponent::StopManagedRecording(bool bActorIsDestroyed)
 {
-    StopManagedRecordingInternal(EMocapRecorderStopReason::Manual);
+    StopManagedRecordingInternal(
+        bActorIsDestroyed ? EMocapRecorderStopReason::Destroyed : EMocapRecorderStopReason::Manual,
+        bActorIsDestroyed);
 }
 
 void UMocapRecorderControlComponent::RequestManagedStop(EMocapRecorderStopReason Reason)
@@ -246,7 +248,7 @@ AActor* UMocapRecorderControlComponent::ResolveRadiusReferenceActor() const
     return UGameplayStatics::GetPlayerPawn(this, 0);
 }
 
-void UMocapRecorderControlComponent::StopManagedRecordingInternal(EMocapRecorderStopReason Reason)
+void UMocapRecorderControlComponent::StopManagedRecordingInternal(EMocapRecorderStopReason Reason, bool bActorIsDestroyed)
 {
     if (!ResolveRecorderComponent())
     {
@@ -263,7 +265,7 @@ void UMocapRecorderControlComponent::StopManagedRecordingInternal(EMocapRecorder
 
     if (RecorderComponent->bIsRecording)
     {
-        RecorderComponent->StopRecording();
+        RecorderComponent->StopRecording(bActorIsDestroyed || Reason == EMocapRecorderStopReason::Destroyed);
     }
 
     LastStopReason = Reason;

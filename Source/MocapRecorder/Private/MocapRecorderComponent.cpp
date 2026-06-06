@@ -6,6 +6,8 @@
 #include "AnimationRuntime.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Components/StaticMeshComponent.h"
 #include "MocapRecorderExportUtils.h"
 #include "MocapRecorderPoseUtils.h"
 
@@ -31,6 +33,54 @@ FString BuildStandaloneBakeAssetName(const UObject* SourceObject, const FString&
 
     const FString BaseName = Owner ? Owner->GetName() : TEXT("Mocap");
     return FString::Printf(TEXT("Mocap_%s_%s"), *BaseName, *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
+}
+
+void CaptureVisualMeshParts(const AActor* Owner, TArray<FMocapRecordedVisualMeshPart>& OutParts)
+{
+    OutParts.Reset();
+
+    if (!IsValid(Owner))
+    {
+        return;
+    }
+
+    TArray<UStaticMeshComponent*> StaticMeshComponents;
+    Owner->GetComponents<UStaticMeshComponent>(StaticMeshComponents);
+    for (const UStaticMeshComponent* StaticMeshComponent : StaticMeshComponents)
+    {
+        if (!IsValid(StaticMeshComponent))
+        {
+            continue;
+        }
+
+        if (UStaticMesh* StaticMesh = StaticMeshComponent->GetStaticMesh())
+        {
+            FMocapRecordedVisualMeshPart& Part = OutParts.AddDefaulted_GetRef();
+            Part.MeshAssetPath = StaticMesh->GetPathName();
+            Part.RelativeTransform = StaticMeshComponent->GetComponentTransform().GetRelativeTransform(Owner->GetActorTransform());
+            Part.ComponentName = StaticMeshComponent->GetFName();
+        }
+    }
+}
+
+FString ResolveVisualMeshAssetPath(const AActor* Owner)
+{
+    TArray<FMocapRecordedVisualMeshPart> VisualMeshParts;
+    CaptureVisualMeshParts(Owner, VisualMeshParts);
+    if (VisualMeshParts.Num() > 0)
+    {
+        return VisualMeshParts[0].MeshAssetPath;
+    }
+
+    if (const USkeletalMeshComponent* SkeletalMeshComponent = Owner->FindComponentByClass<USkeletalMeshComponent>())
+    {
+        if (USkeletalMesh* SkeletalMesh = SkeletalMeshComponent->GetSkeletalMeshAsset())
+        {
+            return SkeletalMesh->GetPathName();
+        }
+    }
+
+    return FString();
 }
 } 
 
@@ -128,7 +178,12 @@ void UMocapRecorderComponent::TickComponent(float DeltaTime, ELevelTick TickType
     }
 
 
-    if (!bIsRecording || !TargetSkeletalMesh || SampleRate <= 0.f)
+    if (!bIsRecording || SampleRate <= 0.f)
+    {
+        return;
+    }
+
+    if (CaptureMode != EMocapCaptureMode::TransformOnly && !TargetSkeletalMesh)
     {
         return;
     }
@@ -155,12 +210,17 @@ UMocapRecorderComponent* UMocapRecorderComponent::CreateBakeSnapshot() const
     Snapshot->SampleRate = SampleRate;
     Snapshot->CaptureMode = CaptureMode;
     Snapshot->StartSampleIndex = StartSampleIndex;
+    Snapshot->EndSampleIndex = EndSampleIndex;
+    Snapshot->SessionTotalSampleCount = SessionTotalSampleCount;
     Snapshot->bTransformOnly = bTransformOnly;
+    Snapshot->bActorWasDestroyedOnStop = bActorWasDestroyedOnStop;
     Snapshot->bPreserveStartingLocation = bPreserveStartingLocation;
     Snapshot->SessionWorldOrigin = SessionWorldOrigin;
 
     Snapshot->RecordedSkeleton = RecordedSkeleton;
     Snapshot->RecordedMeshAsset = RecordedMeshAsset;
+    Snapshot->RecordedSourceMeshAssetPath = RecordedSourceMeshAssetPath;
+    Snapshot->RecordedVisualMeshParts = RecordedVisualMeshParts;
     Snapshot->RecordedMaterialOverrides = RecordedMaterialOverrides;
 
     Snapshot->Frames = Frames;
@@ -180,14 +240,42 @@ UMocapRecorderComponent* UMocapRecorderComponent::CreateBakeSnapshot() const
     return Snapshot;
 }
 
-void UMocapRecorderComponent::StartRecording()
+void UMocapRecorderComponent::StartRecording(bool bInTransformOnly)
 {
+    bExternalSampling = false;
+    CaptureMode = bInTransformOnly ? EMocapCaptureMode::TransformOnly : EMocapCaptureMode::Skeletal;
+    bTransformOnly = bInTransformOnly;
+    bActorWasDestroyedOnStop = false;
+    StartSampleIndex = GetWorld()
+        ? FMath::Max(0, FMath::RoundToInt(GetWorld()->GetTimeSeconds() * FMath::Max(1.f, SampleRate)))
+        : 0;
+    EndSampleIndex = INDEX_NONE;
+    SessionTotalSampleCount = 0;
     bHasWorldBakeBaseline = false;
     WorldBakeBaselineRoot = FTransform::Identity;
 
-
     if (bIsRecording)
         return;
+
+    if (bInTransformOnly)
+    {
+        StartRecording_ExternalTransformOnly(StartSampleIndex);
+        bExternalSampling = false;
+
+        if (UWorld* World = GetWorld())
+        {
+            World->GetTimerManager().ClearTimer(SampleTimerHandle);
+        }
+
+        SampleFrame();
+
+        if (GEngine)
+        {
+            GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Green, TEXT("Mocap Transform Recording Started"));
+        }
+
+        return;
+    }
 
     if (!TargetSkeletalMesh)
     {
@@ -200,6 +288,8 @@ void UMocapRecorderComponent::StartRecording()
         }
         RecordedMeshAsset = TargetSkeletalMesh ? TargetSkeletalMesh->GetSkeletalMeshAsset() : nullptr;
         RecordedSkeleton = RecordedMeshAsset ? RecordedMeshAsset->GetSkeleton() : nullptr;
+        CaptureVisualMeshParts(GetOwner(), RecordedVisualMeshParts);
+        RecordedSourceMeshAssetPath = IsValid(RecordedMeshAsset) ? RecordedMeshAsset->GetPathName() : ResolveVisualMeshAssetPath(GetOwner());
                 
     }
 
@@ -261,6 +351,8 @@ void UMocapRecorderComponent::StartRecording()
     RecordedMeshAsset = TargetSkeletalMesh
         ? TargetSkeletalMesh->GetSkeletalMeshAsset()
         : nullptr;
+    CaptureVisualMeshParts(GetOwner(), RecordedVisualMeshParts);
+    RecordedSourceMeshAssetPath = IsValid(RecordedMeshAsset) ? RecordedMeshAsset->GetPathName() : ResolveVisualMeshAssetPath(GetOwner());
 
     RecordedSkeleton = RecordedMeshAsset
         ? RecordedMeshAsset->GetSkeleton()
@@ -312,6 +404,8 @@ void UMocapRecorderComponent::StartRecording_ExternalWithPreRoll(int32 PreRollFr
 
     bHasWorldBakeBaseline = false;
     WorldBakeBaselineRoot = FTransform::Identity;
+    bActorWasDestroyedOnStop = false;
+    EndSampleIndex = INDEX_NONE;
 
     if (bIsRecording)
         return;
@@ -341,6 +435,7 @@ void UMocapRecorderComponent::StartRecording_ExternalWithPreRoll(int32 PreRollFr
     }
 
     Frames.Reset();
+    TransformFrames.Reset();
     RecordedFrameCount = 0;
     TimeAccumulator = 0.f;
     TimeFromStart = 0.f;
@@ -349,6 +444,8 @@ void UMocapRecorderComponent::StartRecording_ExternalWithPreRoll(int32 PreRollFr
 
     RecordedMeshAsset = TargetSkeletalMesh ? TargetSkeletalMesh->GetSkeletalMeshAsset() : nullptr;
     RecordedSkeleton = RecordedMeshAsset ? RecordedMeshAsset->GetSkeleton() : nullptr;
+    CaptureVisualMeshParts(GetOwner(), RecordedVisualMeshParts);
+    RecordedSourceMeshAssetPath = IsValid(RecordedMeshAsset) ? RecordedMeshAsset->GetPathName() : ResolveVisualMeshAssetPath(GetOwner());
     RecordedMaterialOverrides.Reset();
     if (TargetSkeletalMesh)
     {
@@ -399,6 +496,7 @@ void UMocapRecorderComponent::StartRecording_ExternalTransformOnly(int32 InStart
     bExternalSampling = true;
     CaptureMode = EMocapCaptureMode::TransformOnly;
     StartSampleIndex = FMath::Max(0, InStartSampleIndex);
+    EndSampleIndex = INDEX_NONE;
 
     if (bIsRecording)
         return;
@@ -413,12 +511,15 @@ void UMocapRecorderComponent::StartRecording_ExternalTransformOnly(int32 InStart
     // Reset baseline so transform-only uses the same policy as skeletal
     bHasWorldBakeBaseline = false;
     WorldBakeBaselineRoot = FTransform::Identity;
+    bActorWasDestroyedOnStop = false;
 
     bIsRecording = true;
 
     // Provide a real skeleton so the bake pipeline can produce UAnimSequence.
     RecordedSkeleton = TransformOnlyBakeSkeleton;
     RecordedMeshAsset = nullptr;
+    CaptureVisualMeshParts(GetOwner(), RecordedVisualMeshParts);
+    RecordedSourceMeshAssetPath = ResolveVisualMeshAssetPath(GetOwner());
 
     // Build a 1-bone "recording skeleton description" for the baker.
     RecordedBoneNames.Reset();
@@ -446,10 +547,86 @@ void UMocapRecorderComponent::StartRecording_ExternalTransformOnly(int32 InStart
 
 }
 
-void UMocapRecorderComponent::StopRecording_External()
+void UMocapRecorderComponent::AppendDestroyedStopFrame()
+{
+    bActorWasDestroyedOnStop = true;
+
+    const float Dt = (SampleRate > 0.f) ? (1.f / SampleRate) : (1.f / 60.f);
+    const FVector HiddenScale(0.001, 0.001, 0.001);
+
+    FTransform HiddenTransform = FTransform::Identity;
+    if (TransformFrames.Num() > 0)
+    {
+        HiddenTransform = TransformFrames.Last().World;
+    }
+    else if (Frames.Num() > 0)
+    {
+        const FMocapFrame& LastFrame = Frames.Last();
+        const FVector Translation = LastFrame.Translations.Num() > 0 ? LastFrame.Translations[0] : FVector::ZeroVector;
+        const FQuat Rotation = LastFrame.Rotations.Num() > 0 ? LastFrame.Rotations[0].GetNormalized() : FQuat::Identity;
+        HiddenTransform = FTransform(Rotation, Translation, LastFrame.Scales.Num() > 0 ? LastFrame.Scales[0] : FVector::OneVector);
+    }
+    else if (AActor* Owner = GetOwner())
+    {
+        HiddenTransform = Owner->GetActorTransform();
+        if (bHasWorldBakeBaseline)
+        {
+            HiddenTransform = WorldBakeBaselineRoot.Inverse() * HiddenTransform;
+        }
+    }
+
+    HiddenTransform.SetScale3D(HiddenScale);
+
+    if (CaptureMode == EMocapCaptureMode::TransformOnly || TransformFrames.Num() > 0)
+    {
+        FMocapTransformFrame& TransformFrame = TransformFrames.AddDefaulted_GetRef();
+        TransformFrame.Time = TimeFromStart;
+        TransformFrame.World = HiddenTransform;
+    }
+
+    if (Frames.Num() > 0)
+    {
+        FMocapFrame HiddenFrame = Frames.Last();
+        HiddenFrame.Time = TimeFromStart;
+        for (FVector& Scale : HiddenFrame.Scales)
+        {
+            Scale = HiddenScale;
+        }
+        if (HiddenFrame.Translations.Num() > 0)
+        {
+            HiddenFrame.Translations[0] = HiddenTransform.GetLocation();
+        }
+        if (HiddenFrame.Rotations.Num() > 0)
+        {
+            HiddenFrame.Rotations[0] = HiddenTransform.GetRotation().GetNormalized();
+        }
+        Frames.Add(MoveTemp(HiddenFrame));
+    }
+    else if (CaptureMode == EMocapCaptureMode::TransformOnly)
+    {
+        FMocapFrame& HiddenFrame = Frames.AddDefaulted_GetRef();
+        HiddenFrame.Time = TimeFromStart;
+        HiddenFrame.Translations.Add(HiddenTransform.GetLocation());
+        HiddenFrame.Rotations.Add(HiddenTransform.GetRotation().GetNormalized());
+        HiddenFrame.Scales.Add(HiddenScale);
+#if WITH_EDITORONLY_DATA
+        HiddenFrame.HeadWorld.Add(HiddenTransform.GetLocation());
+        HiddenFrame.TailWorld.Add(HiddenTransform.GetLocation());
+#endif
+    }
+
+    TimeFromStart += Dt;
+}
+
+void UMocapRecorderComponent::StopRecording_External(bool bActorIsDestroyed)
 {
     if (!bIsRecording)
         return;
+
+    if (bActorIsDestroyed)
+    {
+        AppendDestroyedStopFrame();
+    }
 
     bIsRecording = false;
 
@@ -467,10 +644,22 @@ void UMocapRecorderComponent::StopRecording_External()
 
 }
 
-void UMocapRecorderComponent::StopRecording()
+void UMocapRecorderComponent::StopRecording(bool bActorIsDestroyed)
 {
     if (!bIsRecording)
         return;
+
+    if (EndSampleIndex == INDEX_NONE)
+    {
+        EndSampleIndex = GetWorld()
+            ? FMath::Max(StartSampleIndex, FMath::RoundToInt(GetWorld()->GetTimeSeconds() * FMath::Max(1.f, SampleRate)))
+            : StartSampleIndex + FMath::Max(0, GetRecordedFrameCount() - 1);
+    }
+
+    if (bActorIsDestroyed)
+    {
+        AppendDestroyedStopFrame();
+    }
 
     bIsRecording = false;
 
@@ -869,6 +1058,7 @@ void UMocapRecorderComponent::ClearRecordedData()
 {
     Frames.Reset();
     TransformFrames.Reset();
+    bActorWasDestroyedOnStop = false;
     RecordedFrameCount = 0;
     TimeAccumulator = 0.f;
     TimeFromStart = 0.f;

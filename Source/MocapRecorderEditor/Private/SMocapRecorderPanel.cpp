@@ -12,6 +12,7 @@
 #include "Widgets/Views/SListView.h"
 #include "Widgets/Notifications/SProgressBar.h"
 #include "Widgets/Layout/SBorder.h"
+#include "Widgets/Layout/SSeparator.h"
 #include "PropertyCustomizationHelpers.h" // SClassPropertyEntryBox
 #include "Widgets/Input/SEditableTextBox.h"
 #include "MocapCaptureEditorSessionManager.h"
@@ -27,6 +28,10 @@
 void SMocapRecorderPanel::Construct(const FArguments& InArgs)
 {
     SessionManager = FMocapRecorderEditorModule::Get().GetOrCreateSessionManager(nullptr);
+
+    ExportFormatItems.Reset();
+    ExportFormatItems.Add(MakeShared<FString>(TEXT("FBX")));
+    ExportFormatItems.Add(MakeShared<FString>(TEXT("GLTF")));
 
     RefreshTargetList();
     RefreshClassRuleList();
@@ -502,6 +507,47 @@ TSharedRef<SWidget> SMocapRecorderPanel::BuildSettingsPanel()
                 [
                     SNew(STextBlock).Text(FText::FromString(TEXT("Auto Export After Bake")))
                 ]
+        ]
+
+    + SHorizontalBox::Slot().AutoWidth().Padding(12, 2).VAlign(VAlign_Center)
+        [
+            SNew(STextBlock).Text(FText::FromString(TEXT("Format")))
+        ]
+    + SHorizontalBox::Slot().AutoWidth().Padding(2)
+        [
+            SAssignNew(ExportFormatComboBox, SComboBox<TSharedPtr<FString>>)
+                .OptionsSource(&ExportFormatItems)
+                .OnGenerateWidget_Lambda([](TSharedPtr<FString> Item)
+                    {
+                        return SNew(STextBlock).Text(FText::FromString(Item.IsValid() ? *Item : TEXT("FBX")));
+                    })
+                .OnSelectionChanged_Lambda([this](TSharedPtr<FString> Item, ESelectInfo::Type)
+                    {
+                        if (!SessionManager || !Item.IsValid())
+                        {
+                            return;
+                        }
+
+                        SessionManager->SetGroupedExportFormat(
+                            Item->Equals(TEXT("GLTF"), ESearchCase::IgnoreCase)
+                            ? EMocapGroupedExportFormat::GLTF
+                            : EMocapGroupedExportFormat::FBX);
+                    })
+                [
+                    SNew(STextBlock)
+                        .Text_Lambda([this]()
+                            {
+                                if (!SessionManager)
+                                {
+                                    return FText::FromString(TEXT("FBX"));
+                                }
+
+                                return FText::FromString(
+                                    SessionManager->GetGroupedExportFormat() == EMocapGroupedExportFormat::GLTF
+                                    ? TEXT("GLTF")
+                                    : TEXT("FBX"));
+                            })
+                ]
         ];
 }
 
@@ -697,7 +743,7 @@ TSharedRef<SWidget> SMocapRecorderPanel::BuildClassRulesPanel()
                             [
                                 SNew(SVerticalBox)
 
-                                    // Row 1: Enabled + Class picker + tag + require skeletal
+                                    // Row 1: Enabled + Class picker + tag + grouping
                                     + SVerticalBox::Slot().AutoHeight().Padding(2)
                                     [
                                         SNew(SHorizontalBox)
@@ -844,205 +890,12 @@ TSharedRef<SWidget> SMocapRecorderPanel::BuildClassRulesPanel()
                                             ]
                                     ]
 
-                                // Row 2: Auto-stop policies
-                                + SVerticalBox::Slot().AutoHeight().Padding(2)
+                                + SVerticalBox::Slot().AutoHeight().Padding(0, 6, 0, 4)
                                     [
-                                        SNew(SHorizontalBox)
-
-                                            + SHorizontalBox::Slot().AutoWidth().Padding(2).VAlign(VAlign_Center)
-                                            [
-                                                SNew(SCheckBox)
-                                                    .IsChecked_Lambda([this, Index]()
-                                                        {
-                                                            if (!SessionManager || Index == INDEX_NONE) return ECheckBoxState::Unchecked;
-                                                            const auto& Rules = SessionManager->GetClassRules();
-                                                            if (!Rules.IsValidIndex(Index)) return ECheckBoxState::Unchecked;
-                                                            return Rules[Index].AutoStop.bStopWhenNearlyStationary ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
-                                                        })
-                                                    .OnCheckStateChanged_Lambda([this, Index](ECheckBoxState State)
-                                                        {
-                                                            if (SessionManager && Index != INDEX_NONE)
-                                                            {
-                                                                SessionManager->SetRule_StopWhenNearlyStationary(Index, State == ECheckBoxState::Checked);
-                                                            }
-                                                        })
-                                                    [
-                                                        SNew(STextBlock).Text(FText::FromString(TEXT("Stop if stationary")))
-                                                    ]
-                                            ]
-
-                                        + SHorizontalBox::Slot().AutoWidth().Padding(10, 2).VAlign(VAlign_Center)
-                                            [
-                                                SNew(STextBlock).Text(FText::FromString(TEXT("Speed")))
-                                            ]
-
-                                            + SHorizontalBox::Slot().AutoWidth().Padding(2)
-                                            [
-                                                SNew(SNumericEntryBox<float>)
-                                                    .MinValue(0.f).MaxValue(100000.f)
-                                                    .Value_Lambda([this, Index]() -> TOptional<float>
-                                                        {
-                                                            if (!SessionManager || Index == INDEX_NONE) return TOptional<float>();
-                                                            const auto& Rules = SessionManager->GetClassRules();
-                                                            if (!Rules.IsValidIndex(Index)) return TOptional<float>();
-                                                            return TOptional<float>(Rules[Index].AutoStop.LinearSpeedThreshold);
-                                                        })
-
-                                                    .OnValueChanged_Lambda([this, Index](float V)
-                                                        {
-                                                            if (SessionManager && Index != INDEX_NONE)
-                                                            {
-                                                                SessionManager->SetRule_LinearSpeedThreshold(Index, V);
-                                                            }
-                                                        })
-                                            ]
-
-                                        + SHorizontalBox::Slot().AutoWidth().Padding(10, 2).VAlign(VAlign_Center)
-                                            [
-                                                SNew(STextBlock).Text(FText::FromString(TEXT("Hold(s)")))
-                                            ]
-
-                                            + SHorizontalBox::Slot().AutoWidth().Padding(2)
-                                            [
-                                                SNew(SNumericEntryBox<float>)
-                                                    .MinValue(0.f).MaxValue(10.f)
-                                                    .Value_Lambda([this, Index]() -> TOptional<float>
-                                                        {
-                                                            if (!SessionManager || Index == INDEX_NONE) return TOptional<float>();
-                                                            const auto& Rules = SessionManager->GetClassRules();
-                                                            if (!Rules.IsValidIndex(Index)) return TOptional<float>();
-                                                            return TOptional<float>(Rules[Index].AutoStop.StationaryHoldSeconds);
-                                                        })
-
-                                                    .OnValueChanged_Lambda([this, Index](float V)
-                                                        {
-                                                            if (SessionManager && Index != INDEX_NONE)
-                                                            {
-                                                                SessionManager->SetRule_StationaryHoldSeconds(Index, V);
-                                                            }
-                                                        })
-                                            ]
-
-                                        + SHorizontalBox::Slot().AutoWidth().Padding(16, 2).VAlign(VAlign_Center)
-                                            [
-                                                SNew(SCheckBox)
-                                                    .IsChecked_Lambda([this, Index]()
-                                                        {
-                                                            if (!SessionManager || Index == INDEX_NONE) return ECheckBoxState::Unchecked;
-                                                            const auto& Rules = SessionManager->GetClassRules();
-                                                            if (!Rules.IsValidIndex(Index)) return ECheckBoxState::Unchecked;
-                                                            return Rules[Index].AutoStop.bStopWhenOutOfPlayerRadius ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
-                                                        })
-                                                    .OnCheckStateChanged_Lambda([this, Index](ECheckBoxState State)
-                                                        {
-                                                            if (SessionManager && Index != INDEX_NONE)
-                                                            {
-                                                                SessionManager->SetRule_StopWhenOutOfPlayerRadius(Index, State == ECheckBoxState::Checked);
-                                                            }
-                                                        })
-                                                    [
-                                                        SNew(STextBlock).Text(FText::FromString(TEXT("Stop outside player radius")))
-                                                    ]
-                                            ]
-
-                                        + SHorizontalBox::Slot().AutoWidth().Padding(10, 2).VAlign(VAlign_Center)
-                                            [
-                                                SNew(STextBlock).Text(FText::FromString(TEXT("Radius")))
-                                            ]
-
-                                            + SHorizontalBox::Slot().AutoWidth().Padding(2)
-                                            [
-                                                SNew(SNumericEntryBox<float>)
-                                                    .MinValue(0.f).MaxValue(1000000.f)
-                                                    .Value_Lambda([this, Index]() -> TOptional<float>
-                                                        {
-                                                            if (!SessionManager || Index == INDEX_NONE) return TOptional<float>();
-                                                            const auto& Rules = SessionManager->GetClassRules();
-                                                            if (!Rules.IsValidIndex(Index)) return TOptional<float>();
-                                                            return TOptional<float>(Rules[Index].AutoStop.PlayerRadius);
-                                                        })
-
-                                                    .OnValueChanged_Lambda([this, Index](float V)
-                                                        {
-                                                            if (SessionManager && Index != INDEX_NONE)
-                                                            {
-                                                                SessionManager->SetRule_PlayerRadius(Index, V);
-                                                            }
-                                                        })
-                                            ]
+                                        SNew(SSeparator)
+                                            .Orientation(Orient_Horizontal)
                                     ]
 
-                                // Row 3: Stop events + autobake
-                                + SVerticalBox::Slot().AutoHeight().Padding(2)
-                                    [
-                                        SNew(SHorizontalBox)
-
-                                            + SHorizontalBox::Slot().AutoWidth().Padding(2).VAlign(VAlign_Center)
-                                            [
-                                                SNew(SCheckBox)
-                                                    .IsChecked_Lambda([this, Index]()
-                                                        {
-                                                            if (!SessionManager || Index == INDEX_NONE) return ECheckBoxState::Unchecked;
-                                                            const auto& Rules = SessionManager->GetClassRules();
-                                                            if (!Rules.IsValidIndex(Index)) return ECheckBoxState::Unchecked;
-                                                            return Rules[Index].AutoStop.bStopOnHitEvent ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
-                                                        })
-                                                    .OnCheckStateChanged_Lambda([this, Index](ECheckBoxState State)
-                                                        {
-                                                            if (SessionManager && Index != INDEX_NONE)
-                                                            {
-                                                                SessionManager->SetRule_StopOnHitEvent(Index, State == ECheckBoxState::Checked);
-                                                            }
-                                                        })
-                                                    [
-                                                        SNew(STextBlock).Text(FText::FromString(TEXT("Stop on Hit")))
-                                                    ]
-                                            ]
-
-                                        + SHorizontalBox::Slot().AutoWidth().Padding(12, 2).VAlign(VAlign_Center)
-                                            [
-                                                SNew(SCheckBox)
-                                                    .IsChecked_Lambda([this, Index]()
-                                                        {
-                                                            if (!SessionManager || Index == INDEX_NONE) return ECheckBoxState::Unchecked;
-                                                            const auto& Rules = SessionManager->GetClassRules();
-                                                            if (!Rules.IsValidIndex(Index)) return ECheckBoxState::Unchecked;
-                                                            return Rules[Index].AutoStop.bStopOnDestroyed ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
-                                                        })
-                                                    .OnCheckStateChanged_Lambda([this, Index](ECheckBoxState State)
-                                                        {
-                                                            if (SessionManager && Index != INDEX_NONE)
-                                                            {
-                                                                SessionManager->SetRule_StopOnDestroyed(Index, State == ECheckBoxState::Checked);
-                                                            }
-                                                        })
-                                                    [
-                                                        SNew(STextBlock).Text(FText::FromString(TEXT("Stop on Destroyed")))
-                                                    ]
-                                            ]
-
-                                        + SHorizontalBox::Slot().AutoWidth().Padding(20, 2).VAlign(VAlign_Center)
-                                            [
-                                                SNew(SCheckBox)
-                                                    .IsChecked_Lambda([this, Index]()
-                                                        {
-                                                            if (!SessionManager || Index == INDEX_NONE) return ECheckBoxState::Unchecked;
-                                                            const auto& Rules = SessionManager->GetClassRules();
-                                                            if (!Rules.IsValidIndex(Index)) return ECheckBoxState::Unchecked;
-                                                            return Rules[Index].AutoStop.bAutoBakeOnAutoStop ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
-                                                        })
-                                                    .OnCheckStateChanged_Lambda([this, Index](ECheckBoxState State)
-                                                        {
-                                                            if (SessionManager && Index != INDEX_NONE)
-                                                            {
-                                                                SessionManager->SetRule_AutoBakeOnAutoStop(Index, State == ECheckBoxState::Checked);
-                                                            }
-                                                        })
-                                                    [
-                                                        SNew(STextBlock).Text(FText::FromString(TEXT("Auto-bake on stop")))
-                                                    ]
-                                            ]
-                                    ]
                             ];
                     })
         ];
