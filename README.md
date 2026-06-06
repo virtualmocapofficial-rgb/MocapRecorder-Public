@@ -52,4 +52,14 @@ For new projects, use a C++ UE5 project when working with this plugin. C++ proje
 
 For an existing Blueprint-only project, make a backup of the project first. Then open the project in Unreal Engine and create one blank C++ class from `Tools > New C++ Class`. Choose a simple empty class and let Unreal generate the project files.
 
+
 You only need to compile from your IDE one time. This one-time IDE compile allows Unreal to build and load the native plugin modules in your Blueprint project. After that first successful compile, you can reopen the project and continue working normally in Unreal Engine and Blueprints.
+
+<img width="337" height="235" alt="FlowUtilityNodes" src="https://github.com/user-attachments/assets/5f9cfa80-080c-4f99-8880-29fda889373c" />
+<img width="378" height="309" alt="AnimGraphDiagTools" src="https://github.com/user-attachments/assets/9b794db2-9737-46ed-962a-df6a170d0301" />
+<img width="363" height="824" alt="ActorDropDownLocation" src="https://github.com/user-attachments/assets/e00c8913-6943-4d13-a563-46f0195943dd" />
+<img width="315" height="982" alt="WindowDropDownLocation" src="https://github.com/user-attachments/assets/ec2ed869-8891-47c3-ac96-1f26fbee7d42" />
+<img width="372" height="731" alt="RightClickLocation" src="https://github.com/user-attachments/assets/1f91ea4e-65ad-4341-aeec-434248550ade" />
+<img width="961" height="1276" alt="RecorderPanel" src="https://github.com/user-attachments/assets/3459cf7c-2563-490d-90f2-f1a9b18285c8" />
+<img width="570" height="868" alt="MocapRecorderNodes" src="https://github.com/user-attachments/assets/4dcf2207-a3c0-4d23-8478-78830c0c60a5" />
+<img width="691" height="925" alt="MocapRecorderControl Nodes" src="https://github.com/user-attachments/assets/9115d5b7-c9d9-4d24-81df-1607a5d83660" />
