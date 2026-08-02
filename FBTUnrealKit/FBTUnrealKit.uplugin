@@ -1,0 +1,33 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "FBT Unreal Kit",
+	"Description": "Full body tracking runtime backend, calibration, and Blueprint integration for SteamVR/OpenVR and future tracker backends.",
+	"Category": "Animation",
+	"CreatedBy": "Codex",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Plugins": [
+		{
+			"Name": "LiveLink",
+			"Enabled": true
+		},
+		{
+			"Name": "ControlRig",
+			"Enabled": true
+		},
+		{
+			"Name": "RigVM",
+			"Enabled": true
+		}
+	],
+	"Modules": [
+		{
+			"Name": "FBTUnrealKit",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

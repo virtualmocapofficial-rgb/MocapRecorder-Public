@@ -1,0 +1,12 @@
+{
+  "PluginName": "FBTUnrealKit",
+  "PackageVersion": "0.1-dev",
+  "BinaryEngineVersions": [],
+  "SourceCompatibilityTarget": {
+    "Minimum": "5.6",
+    "MaximumTested": "5.6"
+  },
+  "SourceBuildsVerified": [
+    "5.6"
+  ]
+}

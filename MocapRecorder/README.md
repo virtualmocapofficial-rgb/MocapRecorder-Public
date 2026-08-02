@@ -41,7 +41,7 @@ The plugin records motion already available inside Unreal. It does not require o
 - Bake a procedural or physics-assisted performance into reusable Unreal `AnimSequence` assets.
 - Export a grouped FBX or GLTF scene for Blender with transform animation and Blueprint-owned camera motion.
 - Produce a Foley manifest describing spatial left/right/bass gains for later sound-design or audio-tool processing.
-- Record submitted Chaos piece transforms and visibility into a structured manifest for reconstruction or external effects work.
+- Record submitted Chaos piece transforms as real time shatter, fracture, and desolve styled destruction simulations.
 
 ## Installation
 
@@ -51,9 +51,10 @@ An experimental password-protected installer is included in `Installer`. Read [I
 
 ## New Blueprint nodes
 
-The following nodes are new compared with the supplied `MocapRecorder-Public-main.zip` public baseline.
+The following nodes are new compared with the supplied `MocapRecorder-Public-main.zip` public baseline. 
+-Sign Codex, the overly technical tool that doesn't understand what "simple plain words" means. These are the new nodes added to the plugin since the last update.
 
-### Add Foley Audio Recorder
+### Add Foley Audio Recorder in the blueprint 
 
 Function: Creates and registers a `Mocap Foley Audio Recorder Component` on an actor at runtime. It returns the component so the same graph can configure and start it.
 
