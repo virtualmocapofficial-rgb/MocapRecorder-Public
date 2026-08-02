@@ -1,0 +1,13 @@
+{
+  "PluginName": "MocapRecorder",
+  "PackageVersion": "1.0-dev",
+  "BinaryEngineVersions": [],
+  "SourceCompatibilityTarget": {
+    "Minimum": "5.3",
+    "MaximumTested": "5.8"
+  },
+  "SourceBuildsVerified": [
+    "5.6",
+    "5.8"
+  ]
+}

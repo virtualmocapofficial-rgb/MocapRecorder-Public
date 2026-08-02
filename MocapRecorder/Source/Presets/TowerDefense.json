@@ -1,0 +1,98 @@
+{
+	"PresetName": "TowerDefense",
+	"CaptureSampleRateHz": 60,
+	"ExportFrameRateFps": 30,
+	"PreserveSourceSampleRate": false,
+	"AssetPath": "/Game/MocapCaptures",
+	"AutoBakeOnStop": true,
+	"AutoExportAfterBake": true,
+	"GroupedExportFormat": "GLTF",
+	"GroupedExportRootDirectory": "C:\\Users\\kyle\\Desktop\\dotf_journey_to movie\\Videos & Tools\\MocapRecordings",
+	"GroupedExportBatchName": "TowerDefense",
+	"ClassRules": [
+		{
+			"ActorClass": "/Game/Blueprints/Environment/NewGuns/Projectiles/BP_SniperBullet.BP_SniperBullet_C",
+			"Enabled": true,
+			"RequiredTag": "",
+			"RequireSkeletalMesh": false,
+			"TransformOnly": false,
+			"CaptureMode": "Skeletal",
+			"Group": "SniperBullet",
+			"Folder": "Projectiles",
+			"AutoStop":
+			{
+				"StopWhenNearlyStationary": true,
+				"LinearSpeedThreshold": 5,
+				"StationaryHoldSeconds": 0.25,
+				"StopWhenOutOfPlayerRadius": false,
+				"PlayerRadius": 5000,
+				"StopOnHitEvent": false,
+				"StopOnDestroyed": true,
+				"AutoBakeOnAutoStop": true
+			}
+		},
+		{
+			"ActorClass": "/Game/Blueprints/Environment/NewGuns/Turrets/Sniper_Turret.Sniper_Turret_C",
+			"Enabled": true,
+			"RequiredTag": "",
+			"RequireSkeletalMesh": false,
+			"TransformOnly": false,
+			"CaptureMode": "Skeletal",
+			"Group": "SniperTurret",
+			"Folder": "Turrets",
+			"AutoStop":
+			{
+				"StopWhenNearlyStationary": true,
+				"LinearSpeedThreshold": 5,
+				"StationaryHoldSeconds": 0.25,
+				"StopWhenOutOfPlayerRadius": false,
+				"PlayerRadius": 5000,
+				"StopOnHitEvent": false,
+				"StopOnDestroyed": true,
+				"AutoBakeOnAutoStop": true
+			}
+		},
+		{
+			"ActorClass": "/Game/Blueprints/Environment/NewGuns/Turrets/Missile_Turret.Missile_Turret_C",
+			"Enabled": true,
+			"RequiredTag": "",
+			"RequireSkeletalMesh": false,
+			"TransformOnly": false,
+			"CaptureMode": "Skeletal",
+			"Group": "MissileTurret",
+			"Folder": "Turrets",
+			"AutoStop":
+			{
+				"StopWhenNearlyStationary": true,
+				"LinearSpeedThreshold": 5,
+				"StationaryHoldSeconds": 0.25,
+				"StopWhenOutOfPlayerRadius": false,
+				"PlayerRadius": 5000,
+				"StopOnHitEvent": false,
+				"StopOnDestroyed": true,
+				"AutoBakeOnAutoStop": true
+			}
+		},
+		{
+			"ActorClass": "/Game/Blueprints/Environment/NewGuns/Enemy_Logic/BasicEnemy.BasicEnemy_C",
+			"Enabled": true,
+			"RequiredTag": "",
+			"RequireSkeletalMesh": false,
+			"TransformOnly": false,
+			"CaptureMode": "Skeletal",
+			"Group": "BasicEnemy",
+			"Folder": "Enemies",
+			"AutoStop":
+			{
+				"StopWhenNearlyStationary": true,
+				"LinearSpeedThreshold": 5,
+				"StationaryHoldSeconds": 0.25,
+				"StopWhenOutOfPlayerRadius": false,
+				"PlayerRadius": 5000,
+				"StopOnHitEvent": false,
+				"StopOnDestroyed": true,
+				"AutoBakeOnAutoStop": true
+			}
+		}
+	]
+}

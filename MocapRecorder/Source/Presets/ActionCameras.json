@@ -1,0 +1,58 @@
+{
+	"PresetName": "ActionCameras",
+	"CaptureSampleRateHz": 60,
+	"ExportFrameRateFps": 30,
+	"PreserveSourceSampleRate": false,
+	"AssetPath": "/Game/MocapCaptures",
+	"AutoBakeOnStop": true,
+	"AutoExportAfterBake": true,
+	"GroupedExportFormat": "FBX",
+	"GroupedExportRootDirectory": "../../../../../../Users/kyle/Desktop/dotf_journey_to movie/Unreal Engine/MoCap_Levels/GameAnimationSample/Saved/MocapExports",
+	"GroupedExportBatchName": "ActionCamerasTEsting",
+	"ClassRules": [
+		{
+			"ActorClass": "/Game/Blueprints/VRBasics/AnimationBP/FilmTools/BP_CameraMarker.BP_CameraMarker_C",
+			"Enabled": true,
+			"RequiredTag": "",
+			"RequireSkeletalMesh": false,
+			"TransformOnly": false,
+			"ExportCameraComponents": true,
+			"CaptureMode": "Skeletal",
+			"Group": "Player",
+			"Folder": "Cameras",
+			"AutoStop":
+			{
+				"StopWhenNearlyStationary": true,
+				"LinearSpeedThreshold": 5,
+				"StationaryHoldSeconds": 0.25,
+				"StopWhenOutOfPlayerRadius": false,
+				"PlayerRadius": 5000,
+				"StopOnHitEvent": false,
+				"StopOnDestroyed": true,
+				"AutoBakeOnAutoStop": true
+			}
+		},
+		{
+			"ActorClass": "/Game/Blueprints/CBP_SandboxCharacter.CBP_SandboxCharacter_C",
+			"Enabled": true,
+			"RequiredTag": "",
+			"RequireSkeletalMesh": false,
+			"TransformOnly": false,
+			"ExportCameraComponents": true,
+			"CaptureMode": "Skeletal",
+			"Group": "Player",
+			"Folder": "Character",
+			"AutoStop":
+			{
+				"StopWhenNearlyStationary": true,
+				"LinearSpeedThreshold": 5,
+				"StationaryHoldSeconds": 0.25,
+				"StopWhenOutOfPlayerRadius": false,
+				"PlayerRadius": 5000,
+				"StopOnHitEvent": false,
+				"StopOnDestroyed": true,
+				"AutoBakeOnAutoStop": true
+			}
+		}
+	]
+}
